@@ -7,8 +7,11 @@ Python client. Streamlit never writes anywhere; scopes are read-only.
 from __future__ import annotations
 
 import io
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
 import gspread
+import requests
 import streamlit as st
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -19,8 +22,49 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets.readonly",
 ]
 
+_clock_corrected = False
+
+
+def _correct_system_clock_skew() -> None:
+    """Google rejects a service-account JWT whose iat/exp look wrong by even
+    a few minutes ("invalid_grant: Invalid JWT..."). On a machine where the
+    OS clock is drifted and the user has no admin rights to fix it, work
+    around this IN-PROCESS instead: read the real time from a Date header on
+    an HTTPS response, and monkeypatch google.auth's clock source so every
+    JWT it signs uses the corrected time -- the OS clock itself is never
+    touched.
+    """
+    global _clock_corrected
+    if _clock_corrected:
+        return
+    _clock_corrected = True  # only ever attempt this once per process
+
+    try:
+        local_before = datetime.now(timezone.utc)
+        resp = requests.head("https://www.googleapis.com/", timeout=5)
+        server_time = parsedate_to_datetime(resp.headers["Date"])
+        if server_time.tzinfo is None:
+            server_time = server_time.replace(tzinfo=timezone.utc)
+        local_after = datetime.now(timezone.utc)
+        local_mid = local_before + (local_after - local_before) / 2
+        offset = server_time - local_mid
+    except Exception:
+        return  # couldn't reach a time source -- leave the clock as-is
+
+    if abs(offset.total_seconds()) < 5:
+        return  # close enough, nothing to correct
+
+    from google.auth import _helpers
+    original_utcnow = _helpers.utcnow
+
+    def _corrected_utcnow():
+        return original_utcnow() + offset
+
+    _helpers.utcnow = _corrected_utcnow
+
 
 def _load_credentials() -> Credentials:
+    _correct_system_clock_skew()
     info = dict(st.secrets["gcp_service_account"])
     return Credentials.from_service_account_info(info, scopes=SCOPES)
 

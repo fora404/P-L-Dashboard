@@ -5,5 +5,6 @@ google-api-python-client>=2.140
 google-auth>=2.34
 google-auth-httplib2>=0.2
 gspread>=6.1
+requests>=2.32
 python-dateutil>=2.9
 pytest>=8.3
