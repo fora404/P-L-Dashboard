@@ -1,0 +1,192 @@
+/**
+ * Reads the P&L Mapping Master Google Sheet (SKU_MAPPING_MASTER, BOM,
+ * COST_HISTORY) and resolves COGS. Faithful port of the already-validated
+ * pipeline/mapping_master.py — logic verified byte-for-byte against a
+ * pandas/openpyxl reference implementation (0 discrepancies across 20 DE
+ * months, 63,415 rows). Do not "improve" the resolution order here without
+ * re-validating against that reference.
+ *
+ * Reads the LIVE Google Sheet (not a static file copy) so mapping-master
+ * edits are picked up on the next refresh automatically.
+ */
+
+function loadMappingMaster_() {
+  const ss = SpreadsheetApp.openById(MAPPING_MASTER_SPREADSHEET_ID);
+
+  const skuMap = _loadSkuMapping(ss.getSheetByName('SKU_MAPPING_MASTER'));
+  const bom = _loadBom(ss.getSheetByName('BOM'));
+  const costByPn = _loadCostHistory(ss.getSheetByName('COST_HISTORY'));
+
+  return {
+    skuMap: skuMap,
+    bom: bom,
+    costByPn: costByPn,
+    resolveCogs: function (mktLabel, sellerSku, qty, period) {
+      return _resolveCogs(skuMap, bom, costByPn, mktLabel, sellerSku, qty, period);
+    },
+  };
+}
+
+function _sheetRows(sheet) {
+  return sheet.getDataRange().getValues(); // [ [header...], [row...], ... ]
+}
+
+function _headerIndex(header) {
+  const idx = {};
+  header.forEach(function (h, i) { idx[String(h).trim()] = i; });
+  return idx;
+}
+
+function _norm(v) {
+  if (v === null || v === undefined || v === '') return null;
+  return String(v).trim();
+}
+
+/**
+ * COST_HISTORY's "Period" column is a plain string in the source xlsx
+ * (e.g. "2025-10", "2026-current") and the resolver depends on EXACT
+ * string equality against it. Google Sheets, unlike xlsx-via-openpyxl, can
+ * silently auto-convert a text cell that looks date-like (e.g. "2025-10")
+ * into a real Date value depending on how it was entered/formatted -- if
+ * that happened, getValues() would hand back a JS Date object here instead
+ * of the string "2025-10", and a naive string comparison would silently
+ * never match, quietly pushing everything to carry-forward or the 30%
+ * fallback. Defend against that: if the cell comes back as a Date, reformat
+ * it to "YYYY-MM" so exact-period matching still works. Text like
+ * "2026-current" is not date-like, so Sheets should never convert it --
+ * only the plain "YYYY-MM" rows are at risk.
+ */
+function _normPeriodCell_(v) {
+  if (v === null || v === undefined || v === '') return null;
+  if (Object.prototype.toString.call(v) === '[object Date]') {
+    return Utilities.formatDate(v, Session.getScriptTimeZone(), 'yyyy-MM');
+  }
+  return String(v).trim();
+}
+
+function _loadSkuMapping(sheet) {
+  const rows = _sheetRows(sheet);
+  const idx = _headerIndex(rows[0]);
+  const out = {}; // key: marketplace + "||" + sellerSku
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const sellerSku = _norm(r[idx['Seller SKU']]);
+    if (!sellerSku) continue;
+    const marketplace = _norm(r[idx['Marketplace']]);
+    let qtyMult = r[idx['Qty / Pack Multiplier']];
+    qtyMult = (typeof qtyMult === 'number' && !isNaN(qtyMult)) ? qtyMult : 1.0;
+    out[marketplace + '||' + sellerSku] = {
+      productNumber: _norm(r[idx['Product Number / TIP-TOP Number']]),
+      qtyMultiplier: qtyMult,
+    };
+  }
+  return out;
+}
+
+function _loadBom(sheet) {
+  const rows = _sheetRows(sheet);
+  const idx = _headerIndex(rows[0]);
+  const out = {}; // productNumber -> [{componentPn, qty}]
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const pn = _norm(r[idx['Product Number / TIP-TOP Number']]);
+    if (!pn) continue;
+    if (!out[pn]) out[pn] = [];
+    out[pn].push({
+      componentPn: _norm(r[idx['BOM Component P/N']]),
+      qty: (typeof r[idx['Qty']] === 'number') ? r[idx['Qty']] : 0,
+    });
+  }
+  return out;
+}
+
+function _loadCostHistory(sheet) {
+  const rows = _sheetRows(sheet);
+  const idx = _headerIndex(rows[0]);
+  const out = {}; // productNumber -> [{period, cost, costStatus}]
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const sku = r[idx['Seller SKU']];
+    if (sku === null || sku === undefined || sku === '') continue;
+    const pn = _norm(r[idx['Associated Product Number']]);
+    if (!pn) continue;
+    if (!out[pn]) out[pn] = [];
+    const costRaw = r[idx['SKU Configuration Cost']];
+    out[pn].push({
+      period: _normPeriodCell_(r[idx['Period']]),
+      cost: (typeof costRaw === 'number' && !isNaN(costRaw)) ? costRaw : null,
+      costStatus: _norm(r[idx['Cost Status']]),
+    });
+  }
+  return out;
+}
+
+/**
+ * Returns { unitCost, level } or { unitCost: null, level: null }.
+ * Resolution order (must match mapping_master.py exactly):
+ *   1. exact month match, Cost Status == 'Actual'                -> level 'A'
+ *   2. 2026 period, Cost Status == 'Average' (2026 Average Cost)  -> level 'B'
+ *   3. carry-forward from most recent PRIOR 'Actual' month only   -> level 'B'
+ *   4. unresolved
+ */
+function _resolveUnitCost(costByPn, productNumber, period) {
+  const rows = costByPn[productNumber];
+  if (!rows || !rows.length) return { unitCost: null, level: null };
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    if (row.period === period && row.costStatus === 'Actual' && row.cost !== null) {
+      return { unitCost: row.cost, level: 'A' };
+    }
+  }
+
+  if (String(period).indexOf('2026') === 0) {
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      if (row.costStatus === 'Average' && row.cost !== null) {
+        return { unitCost: row.cost, level: 'B' };
+      }
+    }
+  }
+
+  let best = null;
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    if (row.costStatus === 'Actual' && row.cost !== null && row.period &&
+      row.period < period && row.period !== '2026-current') {
+      if (!best || row.period > best.period) best = row;
+    }
+  }
+  if (best) return { unitCost: best.cost, level: 'B' };
+
+  return { unitCost: null, level: null };
+}
+
+/**
+ * Returns { cogs, level } or { cogs: null, level: null } if unresolved.
+ * Caller (Pipeline.gs) applies the Level C 30% fallback when this returns
+ * null — this function only ever returns Level A / B / "A/B (BOM)".
+ */
+function _resolveCogs(skuMap, bom, costByPn, mktLabel, sellerSku, qty, period) {
+  const skuRow = skuMap[mktLabel + '||' + sellerSku];
+  if (!skuRow || !skuRow.productNumber) return { cogs: null, level: null };
+
+  const pn = skuRow.productNumber;
+  const effQty = qty * skuRow.qtyMultiplier;
+
+  const components = bom[pn];
+  if (components && components.length) {
+    let total = 0;
+    for (let i = 0; i < components.length; i++) {
+      const comp = components[i];
+      const resolved = _resolveUnitCost(costByPn, comp.componentPn, period);
+      if (resolved.unitCost === null) return { cogs: null, level: null }; // any unresolved component -> whole BOM unresolved
+      total += resolved.unitCost * comp.qty * effQty;
+    }
+    return { cogs: total, level: 'A/B (BOM)' };
+  }
+
+  const resolved = _resolveUnitCost(costByPn, pn, period);
+  if (resolved.unitCost === null) return { cogs: null, level: null };
+  return { cogs: resolved.unitCost * effQty, level: resolved.level };
+}

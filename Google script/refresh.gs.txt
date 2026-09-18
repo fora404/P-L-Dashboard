@@ -1,0 +1,642 @@
+/**
+ * Incremental refresh orchestration.
+ *
+ *   Refresh Data
+ *     -> check source fingerprints (name+size+lastUpdated) + mapping-master
+ *        fingerprint, per Rebecca's explicit design
+ *     -> only reprocess new/changed files
+ *     -> write/merge into the processed Sheets
+ *     -> keep the previous good aggregate for anything not (re)processed
+ *        this run; never publish a partial period as if it were final
+ *     -> respects the 6-minute Apps Script execution cap via a soft time
+ *        budget + resumable manifest state (a second click picks up
+ *        wherever the previous run left off)
+ *
+ * Processed data lives in its own spreadsheet (created on first run, ID
+ * cached in Script Properties) — aggregates only, per Rebecca's correction.
+ * Transaction-level detail goes to Drive CSVs in PROCESSED_PNL_DRIVE_FOLDER_ID,
+ * not into a Sheet.
+ */
+
+const PROCESSED_SS_PROP_KEY = 'PROCESSED_SPREADSHEET_ID';
+
+const MONTHLY_HEADER = ['marketplace', 'period', 'financial_product_sales_ex_vat',
+  'refunds_ex_vat', 'net_product_revenue', 'direct_amazon_fees', 'advertising_spend',
+  'other_fees', 'fba_inbound_freight', 'transfers_excluded', 'cogs', 'estimated_freight',
+  'estimated_freight_from_fallback', 'freight_estimate_on_estimate_pct',
+  'mfn_order_count', 'mfn_shipping_credit_ex_vat', 'mfn_estimated_dhl_cost', 'mfn_shipping_gap',
+  'contribution_before_ads', 'payment_tacos_pct', 'contribution_after_ads',
+  'row_count', 'last_updated'];
+
+const DQ_HEADER = ['marketplace', 'period', 'cogs_level', 'rows', 'last_updated'];
+
+const EXCEPTIONS_HEADER = ['marketplace', 'seller_sku', 'unresolved_order_rows', 'last_seen'];
+
+// Incremental source-of-truth tables. A reporting month can span more than
+// one source file because Amazon's UTC timestamps put a few boundary rows in
+// the adjacent monthly export. Store each file's contribution separately,
+// then sum all contributions into the public monthly tables.
+const FILE_PERIOD_HEADER = ['marketplace', 'file_id', 'file_name', 'period',
+  'financial_product_sales_ex_vat', 'refunds_ex_vat', 'direct_amazon_fees',
+  'advertising_spend', 'other_fees', 'fba_inbound_freight', 'transfers_excluded', 'cogs',
+  'estimated_freight', 'estimated_freight_from_fallback',
+  'mfn_order_count', 'mfn_shipping_credit_ex_vat', 'row_count', 'last_updated'];
+
+const FILE_DQ_HEADER = ['marketplace', 'file_id', 'file_name', 'period',
+  'cogs_level', 'rows', 'last_updated'];
+
+const FILE_EXCEPTIONS_HEADER = ['marketplace', 'file_id', 'file_name',
+  'seller_sku', 'unresolved_order_rows', 'last_seen'];
+
+const MANIFEST_HEADER = ['marketplace', 'file_id', 'file_name', 'size_bytes',
+  'drive_last_updated', 'md5', 'status', 'rows_processed', 'error', 'last_processed_at'];
+
+const EUROPE_HEADER = ['period', 'financial_product_sales_ex_vat', 'refunds_ex_vat',
+  'net_product_revenue', 'direct_amazon_fees', 'advertising_spend', 'cogs',
+  'estimated_freight', 'estimated_freight_from_fallback', 'freight_estimate_on_estimate_pct',
+  'other_fees', 'fba_inbound_freight', 'mfn_order_count', 'mfn_shipping_credit_ex_vat',
+  'mfn_estimated_dhl_cost', 'mfn_shipping_gap', 'contribution_before_ads', 'shared_fixed_cost',
+  'payment_tacos_pct', 'contribution_after_ads', 'fixed_cost_pct',
+  'fully_loaded_contribution', 'europe_aggregate_valid', 'marketplaces_included'];
+
+function getProcessedSpreadsheet_() {
+  const props = PropertiesService.getScriptProperties();
+  let id = props.getProperty(PROCESSED_SS_PROP_KEY);
+  let ss;
+  if (id) {
+    try {
+      ss = SpreadsheetApp.openById(id);
+    } catch (e) {
+      id = null; // stale/deleted -- fall through and recreate
+    }
+  }
+  if (!id) {
+    ss = SpreadsheetApp.create('Amazon P&L — Processed Data');
+    props.setProperty(PROCESSED_SS_PROP_KEY, ss.getId());
+  }
+  ensureSheetWithHeader_(ss, 'pnl_monthly_marketplace', MONTHLY_HEADER);
+  ensureSheetWithHeader_(ss, 'pnl_monthly_europe', EUROPE_HEADER);
+  ensureSheetWithHeader_(ss, 'pnl_data_quality', DQ_HEADER);
+  ensureSheetWithHeader_(ss, 'pnl_exceptions', EXCEPTIONS_HEADER);
+  ensureSheetWithHeader_(ss, '_manifest', MANIFEST_HEADER);
+  ensureSheetWithHeader_(ss, '_file_period_aggregates', FILE_PERIOD_HEADER);
+  ensureSheetWithHeader_(ss, '_file_period_dq', FILE_DQ_HEADER);
+  ensureSheetWithHeader_(ss, '_file_exceptions', FILE_EXCEPTIONS_HEADER);
+  const defaultSheet = ss.getSheetByName('Sheet1');
+  if (defaultSheet) ss.deleteSheet(defaultSheet);
+  return ss;
+}
+
+function ensureSheetWithHeader_(ss, name, header) {
+  let sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+    sheet.appendRow(header);
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+
+/**
+ * Google Sheets can silently auto-convert a text cell that looks date-like
+ * (our "period" values are always "YYYY-MM", e.g. "2025-02") into a real
+ * Date object -- same risk as the mapping master's Period column (see
+ * MappingMaster.gs's _normPeriodCell_), except here it happens in OUR OWN
+ * output sheets (pnl_monthly_marketplace, pnl_monthly_europe, pnl_data_quality)
+ * whenever the "period" column's cell format is left as Automatic.
+ *
+ * This is not just cosmetic: (1) google.script.run's client bridge cannot
+ * reliably serialize a Date object embedded in a returned structure and
+ * silently hands the web client `null` instead of the real data -- this is
+ * the root cause of the "server returned empty" dashboard bug found
+ * 2026-09-16; (2) upsertByKey_ and recomputeEuropeAggregate_ both use
+ * `period` as part of a lookup/group-by key, so a Date-vs-string mismatch
+ * between a freshly-computed row and a previously-written-then-reread row
+ * would silently create duplicate rows instead of updating the existing one.
+ *
+ * Fixed two ways: writeTable_ pre-formats the period column as Plain Text
+ * before writing, so this should stop happening going forward; readTable_
+ * also defensively normalizes any Date found in a period cell back to
+ * "YYYY-MM" on every read, so already-corrupted cells from before this fix
+ * self-heal without needing to reprocess any source files.
+ */
+function normPeriodValue_(v, timeZone) {
+  if (Object.prototype.toString.call(v) === '[object Date]') {
+    // Interpret the cell in the spreadsheet's timezone. The script timezone
+    // can differ and move midnight across a month boundary (for example,
+    // 2025-03-01 00:00 in UTC+8 appears as 2025-02-28 in Europe/Berlin).
+    return Utilities.formatDate(v, timeZone, 'yyyy-MM');
+  }
+  return v;
+}
+
+function readTable_(sheet) {
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 1) return { header: [], rows: [] };
+  const header = values[0];
+  const periodIdx = header.indexOf('period');
+  const timeZone = sheet.getParent().getSpreadsheetTimeZone();
+  const rows = [];
+  for (let i = 1; i < values.length; i++) {
+    const obj = {};
+    header.forEach(function (h, c) {
+      obj[h] = (c === periodIdx) ? normPeriodValue_(values[i][c], timeZone) : values[i][c];
+    });
+    rows.push(obj);
+  }
+  return { header: header, rows: rows };
+}
+
+function writeTable_(sheet, header, rows) {
+  sheet.clearContents();
+  sheet.appendRow(header);
+  const periodCol = header.indexOf('period') + 1; // 1-based; 0 means "no period column"
+  if (rows.length) {
+    const values = rows.map(function (row) {
+      return header.map(function (h) { return (row[h] === undefined || row[h] === null) ? '' : row[h]; });
+    });
+    if (periodCol > 0) {
+      // Must set the format BEFORE writing values, so Sheets stores the
+      // literal string instead of auto-parsing it as a date.
+      sheet.getRange(2, periodCol, values.length, 1).setNumberFormat('@');
+    }
+    sheet.getRange(2, 1, values.length, header.length).setValues(values);
+  }
+  sheet.setFrozenRows(1);
+}
+
+function upsertByKey_(sheet, header, keyCols, newRowsByKey) {
+  const table = readTable_(sheet);
+  const byKey = {};
+  table.rows.forEach(function (row) {
+    const key = keyCols.map(function (k) { return row[k]; }).join('||');
+    byKey[key] = row;
+  });
+  Object.keys(newRowsByKey).forEach(function (key) {
+    byKey[key] = newRowsByKey[key];
+  });
+  writeTable_(sheet, header, Object.keys(byKey).map(function (k) { return byKey[k]; }));
+}
+
+function removeFileContributions_(rowsByKey, mktCode, fileId) {
+  const prefix = mktCode + '||' + fileId + '||';
+  Object.keys(rowsByKey).forEach(function (key) {
+    if (key.indexOf(prefix) === 0) delete rowsByKey[key];
+  });
+}
+
+function hasFileContributions_(rowsByKey, mktCode, fileId) {
+  const prefix = mktCode + '||' + fileId + '||';
+  return Object.keys(rowsByKey).some(function (key) { return key.indexOf(prefix) === 0; });
+}
+
+function rowsByKey_(rows, keyCols) {
+  const out = {};
+  rows.forEach(function (row) {
+    const key = keyCols.map(function (k) { return row[k]; }).join('||');
+    out[key] = row;
+  });
+  return out;
+}
+
+function recomputeMarketplaceAggregates_(ss) {
+  const fileRows = readTable_(ss.getSheetByName('_file_period_aggregates')).rows;
+  const byMarketPeriod = {};
+  fileRows.forEach(function (row) {
+    const key = row.marketplace + '||' + row.period;
+    if (!byMarketPeriod[key]) byMarketPeriod[key] = {
+      marketplace: row.marketplace, period: row.period,
+      financial_product_sales_ex_vat: 0, refunds_ex_vat: 0,
+      direct_amazon_fees: 0, advertising_spend: 0, other_fees: 0,
+      fba_inbound_freight: 0, transfers_excluded: 0, cogs: 0, estimated_freight: 0,
+      estimated_freight_from_fallback: 0, mfn_order_count: 0,
+      mfn_shipping_credit_ex_vat: 0, row_count: 0,
+      last_updated: '',
+    };
+    const a = byMarketPeriod[key];
+    ['financial_product_sales_ex_vat', 'refunds_ex_vat', 'direct_amazon_fees',
+      'advertising_spend', 'other_fees', 'fba_inbound_freight', 'transfers_excluded', 'cogs',
+      'estimated_freight', 'estimated_freight_from_fallback', 'mfn_order_count',
+      'mfn_shipping_credit_ex_vat', 'row_count'].forEach(function (field) {
+      a[field] += Number(row[field]) || 0;
+    });
+    if (row.last_updated && row.last_updated > a.last_updated) a.last_updated = row.last_updated;
+  });
+
+  const monthly = Object.keys(byMarketPeriod).sort().map(function (key) {
+    const agg = byMarketPeriod[key];
+    const derived = deriveMetrics_(agg, MARKETPLACES[agg.marketplace]);
+    return {
+      marketplace: agg.marketplace, period: agg.period,
+      financial_product_sales_ex_vat: agg.financial_product_sales_ex_vat,
+      refunds_ex_vat: agg.refunds_ex_vat,
+      net_product_revenue: derived.net_product_revenue,
+      direct_amazon_fees: agg.direct_amazon_fees,
+      advertising_spend: agg.advertising_spend,
+      other_fees: agg.other_fees,
+      fba_inbound_freight: agg.fba_inbound_freight,
+      transfers_excluded: agg.transfers_excluded,
+      cogs: agg.cogs,
+      estimated_freight: agg.estimated_freight,
+      estimated_freight_from_fallback: agg.estimated_freight_from_fallback,
+      freight_estimate_on_estimate_pct: derived.freight_estimate_on_estimate_pct,
+      mfn_order_count: agg.mfn_order_count,
+      mfn_shipping_credit_ex_vat: agg.mfn_shipping_credit_ex_vat,
+      mfn_estimated_dhl_cost: derived.mfn_estimated_dhl_cost,
+      mfn_shipping_gap: derived.mfn_shipping_gap,
+      contribution_before_ads: derived.contribution_before_ads,
+      payment_tacos_pct: derived.payment_tacos_pct,
+      contribution_after_ads: derived.contribution_after_ads,
+      row_count: agg.row_count,
+      last_updated: agg.last_updated,
+    };
+  });
+  writeTable_(ss.getSheetByName('pnl_monthly_marketplace'), MONTHLY_HEADER, monthly);
+
+  const fileDq = readTable_(ss.getSheetByName('_file_period_dq')).rows;
+  const dqByKey = {};
+  fileDq.forEach(function (row) {
+    const key = row.marketplace + '||' + row.period + '||' + row.cogs_level;
+    if (!dqByKey[key]) dqByKey[key] = { marketplace: row.marketplace, period: row.period,
+      cogs_level: row.cogs_level, rows: 0, last_updated: '' };
+    dqByKey[key].rows += Number(row.rows) || 0;
+    if (row.last_updated && row.last_updated > dqByKey[key].last_updated) dqByKey[key].last_updated = row.last_updated;
+  });
+  writeTable_(ss.getSheetByName('pnl_data_quality'), DQ_HEADER,
+    Object.keys(dqByKey).sort().map(function (key) { return dqByKey[key]; }));
+
+  const fileExceptions = readTable_(ss.getSheetByName('_file_exceptions')).rows;
+  const exByKey = {};
+  fileExceptions.forEach(function (row) {
+    const key = row.marketplace + '||' + row.seller_sku;
+    if (!exByKey[key]) exByKey[key] = { marketplace: row.marketplace,
+      seller_sku: row.seller_sku, unresolved_order_rows: 0, last_seen: '' };
+    exByKey[key].unresolved_order_rows += Number(row.unresolved_order_rows) || 0;
+    if (row.last_seen && row.last_seen > exByKey[key].last_seen) exByKey[key].last_seen = row.last_seen;
+  });
+  writeTable_(ss.getSheetByName('pnl_exceptions'), EXCEPTIONS_HEADER,
+    Object.keys(exByKey).sort().map(function (key) { return exByKey[key]; }));
+}
+
+function fingerprintOf_(file) {
+  return file.getName() + '|' + file.getSize() + '|' + file.getLastUpdated().toISOString();
+}
+
+/**
+ * Main entry point, called from the client via Refresh Data.
+ * marketplaceCodes: array of marketplace codes to consider (defaults to all
+ * currently configured=true marketplaces — DE only, for now).
+ * forceAll: when true, ignores every fingerprint/manifest skip check and
+ * reprocesses every file regardless of whether Drive thinks it changed.
+ * Diagnostic/repair-only — not wired to any UI button. Use via
+ * forceReprocessAllFromEditor() (Code.gs) if pnl_monthly_marketplace ever
+ * looks wrong for periods whose files show status:'processed' in _manifest
+ * (i.e. corrupted/stale _file_period_aggregates rather than an unprocessed
+ * file) — normal day-to-day refreshes should never need this.
+ */
+function refreshData(marketplaceCodes, forceAll) {
+  const startedAt = Date.now();
+  const codes = (marketplaceCodes && marketplaceCodes.length) ? marketplaceCodes : configuredMarketplaceCodes_();
+  const ss = getProcessedSpreadsheet_();
+
+  const manifestSheet = ss.getSheetByName('_manifest');
+  const manifestTable = readTable_(manifestSheet);
+  const manifestByFileId = {};
+  manifestTable.rows.forEach(function (r) { manifestByFileId[r.file_id] = r; });
+
+  // Mapping-master fingerprint check -- if it changed, every configured
+  // marketplace's files are marked dirty (cost data affects every period).
+  const mmFile = DriveApp.getFileById(MAPPING_MASTER_SPREADSHEET_ID);
+  const mmFingerprint = fingerprintOf_(mmFile);
+  const mmManifestKey = '_mapping_master';
+  const mmPrev = manifestByFileId[mmManifestKey];
+  const mappingMasterChanged = !mmPrev || mmPrev.drive_last_updated !== mmFile.getLastUpdated().toISOString();
+  manifestByFileId[mmManifestKey] = {
+    marketplace: '_mapping_master', file_id: mmManifestKey, file_name: mmFile.getName(),
+    size_bytes: '', drive_last_updated: mmFile.getLastUpdated().toISOString(),
+    md5: '', status: 'tracked', rows_processed: '', error: '',
+    last_processed_at: new Date().toISOString(),
+  };
+
+  let mm = null; // lazy-load only if we actually need to process a file (saves time on a no-op refresh)
+
+  const processedMd5sByMarket = {}; // marketplace -> {md5: fileId} of already-processed files, for duplicate detection
+  manifestTable.rows.forEach(function (r) {
+    if (r.status === 'processed' && r.md5) {
+      if (!processedMd5sByMarket[r.marketplace]) processedMd5sByMarket[r.marketplace] = {};
+      processedMd5sByMarket[r.marketplace][r.md5] = r.file_id;
+    }
+  });
+
+  const filesProcessed = [];
+  const filesSkippedDuplicate = [];
+  const filesSkippedUnchanged = [];
+  const filesPending = [];
+  const filesErrored = [];
+
+  // Persist per-file contributions so multiple files can contribute to the
+  // same reporting month without later files overwriting earlier ones.
+  const filePeriodByKey = rowsByKey_(
+    readTable_(ss.getSheetByName('_file_period_aggregates')).rows,
+    ['marketplace', 'file_id', 'period']);
+  const fileDqByKey = rowsByKey_(
+    readTable_(ss.getSheetByName('_file_period_dq')).rows,
+    ['marketplace', 'file_id', 'period', 'cogs_level']);
+  const fileExceptionsByKey = rowsByKey_(
+    readTable_(ss.getSheetByName('_file_exceptions')).rows,
+    ['marketplace', 'file_id', 'seller_sku']);
+
+  let timeExceeded = false;
+
+  outer:
+  for (let ci = 0; ci < codes.length; ci++) {
+    const mktCode = codes[ci];
+    const mktCfg = MARKETPLACES[mktCode];
+    if (!mktCfg || !mktCfg.configured) continue;
+
+    const folder = DriveApp.getFolderById(mktCfg.driveFolderId);
+    const it = folder.getFiles();
+    const driveFiles = [];
+    while (it.hasNext()) driveFiles.push(it.next());
+    driveFiles.sort(function (a, b) { return a.getName().localeCompare(b.getName()); });
+
+    for (let fi = 0; fi < driveFiles.length; fi++) {
+      if (Date.now() - startedAt > REFRESH_SOFT_TIME_BUDGET_MS) {
+        timeExceeded = true;
+        for (let rem = fi; rem < driveFiles.length; rem++) filesPending.push(driveFiles[rem].getName());
+        break outer;
+      }
+
+      const file = driveFiles[fi];
+      const fileId = file.getId();
+      const fp = fingerprintOf_(file);
+      const prev = manifestByFileId[fileId];
+      const needsProcessing = forceAll || mappingMasterChanged || !prev || prev.status !== 'processed' ||
+        prev.drive_last_updated !== file.getLastUpdated().toISOString() ||
+        String(prev.size_bytes) !== String(file.getSize()) ||
+        !hasFileContributions_(filePeriodByKey, mktCode, fileId);
+
+      if (!needsProcessing) {
+        filesSkippedUnchanged.push(file.getName());
+        continue;
+      }
+
+      let md5;
+      try {
+        md5 = fileMd5_(file);
+      } catch (e) {
+        filesErrored.push({ file: file.getName(), error: String(e) });
+        manifestByFileId[fileId] = { marketplace: mktCode, file_id: fileId, file_name: file.getName(),
+          size_bytes: file.getSize(), drive_last_updated: file.getLastUpdated().toISOString(),
+          md5: '', status: 'error', rows_processed: '', error: String(e),
+          last_processed_at: new Date().toISOString() };
+        continue;
+      }
+
+      const dupOf = processedMd5sByMarket[mktCode] && processedMd5sByMarket[mktCode][md5];
+      if (dupOf && dupOf !== fileId) {
+        removeFileContributions_(filePeriodByKey, mktCode, fileId);
+        removeFileContributions_(fileDqByKey, mktCode, fileId);
+        removeFileContributions_(fileExceptionsByKey, mktCode, fileId);
+        filesSkippedDuplicate.push(file.getName() + ' (identical content to already-processed file ' + dupOf + ')');
+        manifestByFileId[fileId] = { marketplace: mktCode, file_id: fileId, file_name: file.getName(),
+          size_bytes: file.getSize(), drive_last_updated: file.getLastUpdated().toISOString(),
+          md5: md5, status: 'skipped_duplicate', rows_processed: '', error: 'Duplicate of ' + dupOf,
+          last_processed_at: new Date().toISOString() };
+        continue;
+      }
+
+      try {
+        if (!mm) mm = loadMappingMaster_();
+        const csvData = readCsvFile_(file);
+        const result = processFileRows_(csvData, mktCode, mktCfg, mm);
+
+        // Replace this file's complete prior contribution. This handles a
+        // changed file that gains/loses a boundary period without leaving
+        // stale fragments behind.
+        removeFileContributions_(filePeriodByKey, mktCode, fileId);
+        removeFileContributions_(fileDqByKey, mktCode, fileId);
+        removeFileContributions_(fileExceptionsByKey, mktCode, fileId);
+
+        Object.keys(result.periods).forEach(function (period) {
+          const agg = result.periods[period];
+          const key = mktCode + '||' + fileId + '||' + period;
+          filePeriodByKey[key] = {
+            marketplace: mktCode, file_id: fileId, file_name: file.getName(), period: period,
+            financial_product_sales_ex_vat: agg.financial_product_sales_ex_vat,
+            refunds_ex_vat: agg.refunds_ex_vat,
+            direct_amazon_fees: agg.direct_amazon_fees,
+            advertising_spend: agg.advertising_spend,
+            other_fees: agg.other_fees,
+            fba_inbound_freight: agg.fba_inbound_freight,
+            transfers_excluded: agg.transfers_excluded,
+            cogs: agg.cogs,
+            estimated_freight: agg.estimated_freight,
+            estimated_freight_from_fallback: agg.estimated_freight_from_fallback,
+            mfn_order_count: agg.mfn_order_count,
+            mfn_shipping_credit_ex_vat: agg.mfn_shipping_credit_ex_vat,
+            row_count: agg.row_count,
+            last_updated: new Date().toISOString(),
+          };
+        });
+
+        Object.keys(result.dataQuality).forEach(function (period) {
+          const levels = result.dataQuality[period];
+          Object.keys(levels).forEach(function (level) {
+            const key = mktCode + '||' + fileId + '||' + period + '||' + level;
+            fileDqByKey[key] = { marketplace: mktCode, file_id: fileId,
+              file_name: file.getName(), period: period, cogs_level: level,
+              rows: levels[level], last_updated: new Date().toISOString() };
+          });
+        });
+
+        Object.keys(result.unmappedSkus).forEach(function (sku) {
+          const key = mktCode + '||' + fileId + '||' + sku;
+          fileExceptionsByKey[key] = { marketplace: mktCode, file_id: fileId,
+            file_name: file.getName(), seller_sku: sku,
+            unresolved_order_rows: result.unmappedSkus[sku], last_seen: new Date().toISOString() };
+        });
+
+        writeEnrichedCsvToDrive_(mktCode, result, file.getName());
+
+        manifestByFileId[fileId] = { marketplace: mktCode, file_id: fileId, file_name: file.getName(),
+          size_bytes: file.getSize(), drive_last_updated: file.getLastUpdated().toISOString(),
+          md5: md5, status: 'processed', rows_processed: result.qa.rowCount,
+          error: (result.qa.reconMismatches > 0 ? result.qa.reconMismatches + ' row-level reconciliation mismatches' : ''),
+          last_processed_at: new Date().toISOString() };
+        if (!processedMd5sByMarket[mktCode]) processedMd5sByMarket[mktCode] = {};
+        processedMd5sByMarket[mktCode][md5] = fileId;
+        filesProcessed.push(file.getName() + ' (' + result.qa.rowCount + ' rows)');
+      } catch (e) {
+        filesErrored.push({ file: file.getName(), error: String(e) });
+        manifestByFileId[fileId] = { marketplace: mktCode, file_id: fileId, file_name: file.getName(),
+          size_bytes: file.getSize(), drive_last_updated: file.getLastUpdated().toISOString(),
+          md5: md5 || '', status: 'error', rows_processed: '', error: String(e),
+          last_processed_at: new Date().toISOString() };
+        // Do NOT touch this file's stored contributions on error -- the
+        // previous good per-file aggregate (if any) stays as-is.
+      }
+    }
+  }
+
+  // Persist manifest (includes both this run's updates and everything untouched).
+  writeTable_(manifestSheet, MANIFEST_HEADER, Object.keys(manifestByFileId).map(function (k) { return manifestByFileId[k]; }));
+
+  writeTable_(ss.getSheetByName('_file_period_aggregates'), FILE_PERIOD_HEADER,
+    Object.keys(filePeriodByKey).map(function (key) { return filePeriodByKey[key]; }));
+  writeTable_(ss.getSheetByName('_file_period_dq'), FILE_DQ_HEADER,
+    Object.keys(fileDqByKey).map(function (key) { return fileDqByKey[key]; }));
+  writeTable_(ss.getSheetByName('_file_exceptions'), FILE_EXCEPTIONS_HEADER,
+    Object.keys(fileExceptionsByKey).map(function (key) { return fileExceptionsByKey[key]; }));
+
+  recomputeMarketplaceAggregates_(ss);
+
+  const europeValid = recomputeEuropeAggregate_(ss);
+
+  return {
+    ok: filesErrored.length === 0,
+    partial: timeExceeded,
+    filesProcessed: filesProcessed,
+    filesSkippedDuplicate: filesSkippedDuplicate,
+    filesSkippedUnchanged: filesSkippedUnchanged.length, // count only -- can be the whole folder on a no-op refresh
+    filesPending: filesPending,
+    filesErrored: filesErrored,
+    mappingMasterChanged: mappingMasterChanged,
+    europeAggregateValid: europeValid,
+    lastRefreshAt: new Date().toISOString(),
+    elapsedMs: Date.now() - startedAt,
+  };
+}
+
+/**
+ * Europe aggregate is only valid (per role prompt + Rebecca's config note)
+ * once EVERY marketplace in MARKETPLACES is present with processed data --
+ * not just every "configured:true" one. A stub marketplace still counts as
+ * "not yet included". With DE only, this recomputes the DE-only total but
+ * marks europe_aggregate_valid=false and leaves Shared Fixed Cost / Fixed
+ * Cost % / Fully Loaded Contribution blank, so the dashboard never presents
+ * a one-country number as if it were an All-Europe P&L.
+ */
+function recomputeEuropeAggregate_(ss) {
+  const monthly = readTable_(ss.getSheetByName('pnl_monthly_marketplace')).rows;
+  const allCodes = allMarketplaceCodes_();
+  const presentCodes = {};
+  const byPeriod = {};
+
+  monthly.forEach(function (row) {
+    presentCodes[row.marketplace] = true;
+    const p = row.period;
+    if (!byPeriod[p]) byPeriod[p] = {
+      financial_product_sales_ex_vat: 0, refunds_ex_vat: 0, direct_amazon_fees: 0,
+      advertising_spend: 0, cogs: 0, estimated_freight: 0, estimated_freight_from_fallback: 0,
+      other_fees: 0, fba_inbound_freight: 0, mfn_order_count: 0,
+      mfn_shipping_credit_ex_vat: 0, mfn_estimated_dhl_cost: 0, mfn_shipping_gap: 0,
+    };
+    const a = byPeriod[p];
+    a.financial_product_sales_ex_vat += Number(row.financial_product_sales_ex_vat) || 0;
+    a.refunds_ex_vat += Number(row.refunds_ex_vat) || 0;
+    a.direct_amazon_fees += Number(row.direct_amazon_fees) || 0;
+    a.advertising_spend += Number(row.advertising_spend) || 0;
+    a.cogs += Number(row.cogs) || 0;
+    a.estimated_freight += Number(row.estimated_freight) || 0;
+    a.estimated_freight_from_fallback += Number(row.estimated_freight_from_fallback) || 0;
+    a.other_fees += Number(row.other_fees) || 0;
+    a.fba_inbound_freight += Number(row.fba_inbound_freight) || 0;
+    a.mfn_order_count += Number(row.mfn_order_count) || 0;
+    a.mfn_shipping_credit_ex_vat += Number(row.mfn_shipping_credit_ex_vat) || 0;
+    a.mfn_estimated_dhl_cost += Number(row.mfn_estimated_dhl_cost) || 0;
+    a.mfn_shipping_gap += Number(row.mfn_shipping_gap) || 0;
+  });
+
+  const isFullEurope = allCodes.every(function (c) { return presentCodes[c]; });
+  const includedList = Object.keys(presentCodes).sort();
+
+  const europeRows = Object.keys(byPeriod).sort().map(function (period) {
+    const a = byPeriod[period];
+    const netRevenue = a.financial_product_sales_ex_vat + a.refunds_ex_vat;
+    // other_fees/fba_inbound_freight/mfn_shipping_gap are SIGNED terms —
+    // same convention as the per-marketplace formula in deriveMetrics_.
+    const contributionBeforeAds = netRevenue - Math.abs(a.direct_amazon_fees) - Math.abs(a.cogs)
+      - Math.abs(a.estimated_freight) + a.other_fees + a.fba_inbound_freight + a.mfn_shipping_gap;
+    const paymentTacosPct = a.financial_product_sales_ex_vat ?
+      Math.round((Math.abs(a.advertising_spend) / a.financial_product_sales_ex_vat) * 1000) / 10 : null;
+    const contributionAfterAds = contributionBeforeAds - Math.abs(a.advertising_spend);
+    const fixedCostPct = (isFullEurope && netRevenue) ?
+      Math.round((Math.abs(SHARED_FIXED_COST_EUR_PER_MONTH) / netRevenue) * 1000) / 10 : null;
+    const freightEstimateOnEstimatePct = a.estimated_freight
+      ? Math.round(a.estimated_freight_from_fallback / a.estimated_freight * 1000) / 10 : null;
+    return {
+      period: period,
+      financial_product_sales_ex_vat: a.financial_product_sales_ex_vat,
+      refunds_ex_vat: a.refunds_ex_vat,
+      net_product_revenue: netRevenue,
+      direct_amazon_fees: a.direct_amazon_fees,
+      advertising_spend: a.advertising_spend,
+      cogs: a.cogs,
+      estimated_freight: a.estimated_freight,
+      estimated_freight_from_fallback: a.estimated_freight_from_fallback,
+      freight_estimate_on_estimate_pct: freightEstimateOnEstimatePct === null ? '' : freightEstimateOnEstimatePct,
+      other_fees: a.other_fees,
+      fba_inbound_freight: a.fba_inbound_freight,
+      mfn_order_count: a.mfn_order_count,
+      mfn_shipping_credit_ex_vat: a.mfn_shipping_credit_ex_vat,
+      mfn_estimated_dhl_cost: a.mfn_estimated_dhl_cost,
+      mfn_shipping_gap: a.mfn_shipping_gap,
+      contribution_before_ads: contributionBeforeAds,
+      shared_fixed_cost: isFullEurope ? -SHARED_FIXED_COST_EUR_PER_MONTH : '',
+      payment_tacos_pct: paymentTacosPct === null ? '' : paymentTacosPct,
+      contribution_after_ads: contributionAfterAds,
+      fixed_cost_pct: fixedCostPct === null ? '' : fixedCostPct,
+      fully_loaded_contribution: isFullEurope ?
+        (contributionBeforeAds - Math.abs(a.advertising_spend) - SHARED_FIXED_COST_EUR_PER_MONTH) : '',
+      europe_aggregate_valid: isFullEurope,
+      marketplaces_included: includedList.join(', '),
+    };
+  });
+
+  writeTable_(ss.getSheetByName('pnl_monthly_europe'), EUROPE_HEADER, europeRows);
+  return isFullEurope;
+}
+
+/**
+ * Writes the transaction-enriched rows for ONE processed file to a Drive
+ * CSV in 02_PROCESSED/Aggregates/PNL, per Rebecca's instruction that
+ * transaction-level detail belongs in Drive, not in a Sheet. Named by
+ * marketplace + source file (not by period) so a reprocess of the same
+ * source file cleanly replaces its own prior output.
+ *
+ * NOTE: this is a lighter-weight substitute for the Python pipeline's full
+ * enriched-row CSV (which includes every row's classification/COGS detail).
+ * Re-deriving that exact same file from processFileRows_'s current return
+ * shape (period aggregates, not row-level detail) is not done here -- doing
+ * it would mean also returning full row-level arrays from processFileRows_,
+ * which was intentionally kept aggregate-only to control memory in a single
+ * Apps Script execution over hundreds of files at full 9-marketplace scale.
+ * This writes a per-file QA summary CSV instead. If full row-level
+ * transaction detail must be reproduced for an audit, re-run the existing
+ * validated Python pipeline against the same raw files -- it already
+ * produces pnl_transaction_enriched_DE.csv today. Flagged as an open
+ * question for Rebecca/01: is a Sheet-and-GAS-only system expected to also
+ * reproduce full transaction-level CSVs, or is the Python pipeline's output
+ * acceptable as the audit trail since both are verified to agree?
+ */
+function writeEnrichedCsvToDrive_(mktCode, result, sourceFileName) {
+  const folder = DriveApp.getFolderById(PROCESSED_PNL_DRIVE_FOLDER_ID);
+  const outName = 'pnl_file_summary_' + mktCode + '_' + sourceFileName.replace(/[^A-Za-z0-9_.-]/g, '_') + '.csv';
+
+  const lines = ['period,row_count,financial_product_sales_ex_vat,refunds_ex_vat,advertising_spend,cogs,cogs_levels_json'];
+  Object.keys(result.periods).sort().forEach(function (period) {
+    const a = result.periods[period];
+    const levels = result.dataQuality[period] || {};
+    lines.push([period, a.row_count, a.financial_product_sales_ex_vat, a.refunds_ex_vat,
+      a.advertising_spend, a.cogs, '"' + JSON.stringify(levels).replace(/"/g, '""') + '"'].join(','));
+  });
+  const csvText = lines.join('\n');
+
+  const existing = folder.getFilesByName(outName);
+  if (existing.hasNext()) {
+    existing.next().setContent(csvText);
+  } else {
+    folder.createFile(outName, csvText, MimeType.CSV);
+  }
+}

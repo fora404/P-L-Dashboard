@@ -1,0 +1,238 @@
+/**
+ * Row-level classification + COGS resolution + per-period aggregation for
+ * ONE source file. Faithful port of pipeline/metrics.py + the relevant parts
+ * of ingest.py — verified row-by-row against the validated pandas pipeline
+ * (exact match on row_count, dup count, raw totals, reconciliation
+ * mismatches, and COGS coverage buckets A/B/C/BOM/NaN across all 20 DE
+ * months). See docs/_appsscript_vs_python_reconciliation.md.
+ *
+ * DESIGN CHOICE — one file = one period: unlike the Python pipeline (which
+ * loads ALL files for a marketplace into one dataframe before aggregating),
+ * this port processes and aggregates ONE FILE AT A TIME so a Refresh only
+ * has to touch changed files. This assumes each source file's rows belong
+ * to a single dominant P&L period (true for all 20 DE monthly files). If a
+ * file's rows split across >1 period, this function aggregates each period
+ * separately (so it's not silently wrong), but if a future marketplace's
+ * raw export is NOT cleanly one-file-per-period in a different way (e.g.
+ * the same month split across two files), upserting each file's period
+ * aggregate will OVERWRITE rather than ADD TO a previous file's partial
+ * contribution for that period. This has not come up with DE (verified 1
+ * file = 1 period, 20/20). Flag this explicitly to Rebecca/01 before
+ * relying on it for a marketplace whose export layout is unconfirmed.
+ */
+
+function emptyPeriodAgg_() {
+  return {
+    financial_product_sales_ex_vat: 0, refunds_ex_vat: 0, direct_amazon_fees: 0,
+    advertising_spend: 0, other_fees: 0, fba_inbound_freight: 0, transfers_excluded: 0,
+    cogs: 0, estimated_freight: 0, estimated_freight_from_fallback: 0, row_count: 0,
+    mfn_order_ids: {}, // plain object used as a Set of distinct MFN order_ids this period
+    mfn_shipping_credit_ex_vat: 0,
+  };
+}
+
+function categoryOf_(mktCfg, txnType, description) {
+  const cls = mktCfg.classification;
+  for (let i = 0; i < cls.transfers.length; i++) {
+    if (txnType === cls.transfers[i].txnType) return 'transfer';
+  }
+  for (let i = 0; i < cls.advertising.length; i++) {
+    const rule = cls.advertising[i];
+    if (txnType === rule.txnType && description === rule.description) return 'advertising';
+  }
+  const fbaInbound = cls.fbaInboundFreight || [];
+  for (let i = 0; i < fbaInbound.length; i++) {
+    const rule = fbaInbound[i];
+    if (txnType === rule.txnType && description === rule.description) return 'fba_inbound_freight';
+  }
+  if (cls.orderTypes.indexOf(txnType) >= 0) return 'order';
+  if (cls.refundTypes.indexOf(txnType) >= 0) return 'refund';
+  return 'other_fee';
+}
+
+/**
+ * Processes one already-read CSV ({header, rows}) for one marketplace.
+ * Returns { periods: {period: agg}, dataQuality: {period: {level: count}},
+ * qa: {...}, unmappedSkus: Set-like object }.
+ */
+function processFileRows_(csvData, mktCode, mktCfg, mm) {
+  const header = csvData.header;
+  const colIdx = {};
+  header.forEach(function (h, i) { colIdx[h] = i; });
+
+  const periods = {};
+  const dataQuality = {}; // period -> {level: count}
+  const unmappedSkus = {}; // sellerSku -> count, for the Cost/Exception view
+  let rowCount = 0;
+  let rawTotalSum = 0;
+  let transfersTotal = 0;
+  let reconMismatches = 0;
+  const periodsTouched = {};
+
+  const colMap = mktCfg.columnMap;
+  const amountFields = {};
+  mktCfg.amountFields.forEach(function (f) { amountFields[f] = true; });
+
+  // Reverse map: raw column name -> canonical, already have colMap that way.
+  const rawColNames = Object.keys(colMap);
+
+  for (let r = 0; r < csvData.rows.length; r++) {
+    const rawRow = csvData.rows[r];
+    if (!rawRow.some(function (c) { return String(c).trim() !== ''; })) continue;
+
+    const row = {};
+    for (let c = 0; c < rawColNames.length; c++) {
+      const rawCol = rawColNames[c];
+      const canon = colMap[rawCol];
+      const i = colIdx[rawCol];
+      const v = (i !== undefined && i < rawRow.length) ? rawRow[i] : null;
+      row[canon] = amountFields[canon] ? parseAmount_(v) : v;
+    }
+
+    rowCount++;
+    rawTotalSum += row.total;
+
+    const cat = categoryOf_(mktCfg, row.txn_type, row.description);
+    const period = parsePeriod_(row.datetime);
+    if (!period) continue; // unparseable date -- excluded from aggregates; caught by row_count vs sum-of-periods check in Refresh.gs
+    periodsTouched[period] = true;
+
+    if (cat === 'transfer') transfersTotal += row.total;
+
+    // Reconciliation identity check (data-integrity QA, mirrors metrics.py).
+    const componentSum = (row.sales_ex_vat || 0) + (row.product_vat || 0)
+      + (row.shipping_credit || 0) + (row.shipping_credit_tax || 0)
+      + (row.giftwrap_credit || 0) + (row.giftwrap_credit_tax || 0)
+      + (row.promo_rebate || 0) + (row.promo_rebate_tax || 0)
+      + (row.marketplace_withheld_tax || 0) + (row.selling_fees || 0)
+      + (row.fba_fees || 0) + (row.other_transaction_fees || 0)
+      + (row.other_amount || 0);
+    if (Math.round((row.total - componentSum) * 100) / 100 !== 0) reconMismatches++;
+
+    if (!periods[period]) periods[period] = emptyPeriodAgg_();
+    const agg = periods[period];
+    agg.row_count++;
+
+    const revenue = (cat === 'order' || cat === 'refund') ? row.sales_ex_vat : 0;
+    if (revenue > 0) agg.financial_product_sales_ex_vat += revenue;
+    else if (revenue < 0) agg.refunds_ex_vat += revenue;
+
+    const directFee = (row.selling_fees || 0) + (row.fba_fees || 0);
+    agg.direct_amazon_fees += directFee;
+    if (cat === 'advertising') agg.advertising_spend += row.total;
+    // Fee-only rows can hold their full total in the selling/FBA fee
+    // components. Those are already included above, so only the residual is
+    // Other Fees / FBA Inbound Freight; otherwise the same expense is
+    // counted twice.
+    if (cat === 'other_fee') agg.other_fees += row.total - directFee;
+    if (cat === 'fba_inbound_freight') agg.fba_inbound_freight += row.total - directFee;
+    if (cat === 'transfer') agg.transfers_excluded += row.total;
+
+    // MFN (merchant-fulfilled) outbound shipping metrics — TEMPORARY per
+    // Rebecca 2026-09-17. Shipping credit is summed across EVERY category
+    // for MFN-fulfilled rows (not just 'order'), so a negative reversal on a
+    // refund row correctly claws back an earlier credit rather than being
+    // dropped. Distinct order_id is tracked only on 'order' rows, matching
+    // the validated Python pipeline; verified empirically against the full
+    // DE dataset that no MFN order's rows ever split across source files or
+    // periods, so a simple per-file/per-period distinct count (summed across
+    // files in recomputeMarketplaceAggregates_) is exactly equivalent to a
+    // single global count for DE. Re-verify before relying on this for a
+    // future marketplace.
+    if (mktCfg.mfnFulfilmentValue && row.fulfilment === mktCfg.mfnFulfilmentValue) {
+      agg.mfn_shipping_credit_ex_vat += (row.shipping_credit || 0);
+      if (cat === 'order' && row.order_id) agg.mfn_order_ids[row.order_id] = true;
+    }
+
+    if (cat === 'order') {
+      if (!dataQuality[period]) dataQuality[period] = {};
+      const qty = (row.qty !== null && row.qty !== undefined && row.qty !== '') ? parseFloat(row.qty) : 0;
+      if (!row.seller_sku || !qty) {
+        // Matches the validated pipeline: missing SKU/qty on an order row
+        // gets cogs=0 and level "NaN" -- the 30% fallback is NEVER applied
+        // here (only for SKU-present-but-unmappable rows, below).
+        dataQuality[period]['NaN'] = (dataQuality[period]['NaN'] || 0) + 1;
+      } else {
+        const resolved = mm.resolveCogs(mktCfg.mappingMasterLabel, row.seller_sku, qty, period);
+        let cogs, level;
+        if (resolved.cogs !== null) {
+          cogs = resolved.cogs; level = resolved.level;
+        } else {
+          cogs = Math.max(row.sales_ex_vat || 0, 0) * LEGACY_COGS_FALLBACK_PCT_OF_SALES;
+          level = 'C';
+          unmappedSkus[row.seller_sku] = (unmappedSkus[row.seller_sku] || 0) + 1;
+        }
+        dataQuality[period][level] = (dataQuality[period][level] || 0) + 1;
+        agg.cogs += cogs;
+        const freight = Math.abs(cogs) * FREIGHT_FALLBACK_PCT_OF_COGS;
+        agg.estimated_freight += freight;
+        // "estimated-on-estimated": this row's COGS itself came from the
+        // legacy 30% fallback (level 'C'), so the freight estimate is a
+        // percentage OF a percentage. Normal case for DE (88.2% of order
+        // rows), not an edge case — must be surfaced as a share.
+        if (level === 'C') agg.estimated_freight_from_fallback += freight;
+      }
+    }
+  }
+
+  // Convert the internal per-file order-id Set into a plain count for
+  // storage. The Set itself only matters WITHIN one file (a multi-item
+  // order generates multiple rows but must count once); summing per-file
+  // counts across files for the same period is exactly equivalent to one
+  // global distinct count for DE (verified empirically 2026-09-17: zero MFN
+  // orders split across source files or periods) — re-verify before relying
+  // on this for a future marketplace.
+  Object.keys(periods).forEach(function (period) {
+    periods[period].mfn_order_count = Object.keys(periods[period].mfn_order_ids).length;
+    delete periods[period].mfn_order_ids;
+  });
+
+  return {
+    periods: periods,
+    dataQuality: dataQuality,
+    unmappedSkus: unmappedSkus,
+    qa: {
+      rowCount: rowCount,
+      rawTotalSum: Math.round(rawTotalSum * 100) / 100,
+      transfersTotal: Math.round(transfersTotal * 100) / 100,
+      reconMismatches: reconMismatches,
+      periodsTouched: Object.keys(periodsTouched),
+    },
+  };
+}
+
+/** Derives the display metrics (net revenue, contribution, TACoS, ...) from
+ * a raw period aggregate. Matches metrics.py's monthly_aggregate(). mktCfg
+ * supplies the MFN DHL rate; pass null/undefined to skip MFN entirely (e.g.
+ * a marketplace with no mfnDhlCostPerShipmentEur configured). */
+function deriveMetrics_(agg, mktCfg) {
+  const netRevenue = agg.financial_product_sales_ex_vat + agg.refunds_ex_vat;
+  const rate = mktCfg && mktCfg.mfnDhlCostPerShipmentEur;
+  const mfnEstimatedDhlCost = rate ? -((agg.mfn_order_count || 0) * rate) : 0;
+  const mfnShippingCreditExVat = agg.mfn_shipping_credit_ex_vat || 0;
+  const mfnShippingGap = mfnShippingCreditExVat + mfnEstimatedDhlCost;
+  // other_fees and fba_inbound_freight are SIGNED terms (credits increase
+  // Contribution, charges reduce it) per Rebecca's 2026-09-17 ruling and the
+  // 08 role prompt's explicit "never implement generic -|other_fees|"
+  // instruction. direct_amazon_fees/cogs/estimated_freight remain
+  // unconditional costs (abs-subtracted) as before.
+  const contributionBeforeAds = netRevenue - Math.abs(agg.direct_amazon_fees)
+    - Math.abs(agg.cogs) - Math.abs(agg.estimated_freight)
+    + (agg.other_fees || 0) + (agg.fba_inbound_freight || 0) + mfnShippingGap;
+  const tacos = agg.financial_product_sales_ex_vat
+    ? Math.round((Math.abs(agg.advertising_spend) / agg.financial_product_sales_ex_vat) * 1000) / 10
+    : null;
+  const contributionAfterAds = contributionBeforeAds - Math.abs(agg.advertising_spend);
+  const freightEstimateOnEstimatePct = agg.estimated_freight
+    ? Math.round((agg.estimated_freight_from_fallback || 0) / agg.estimated_freight * 1000) / 10
+    : null;
+  return {
+    net_product_revenue: netRevenue,
+    mfn_estimated_dhl_cost: mfnEstimatedDhlCost,
+    mfn_shipping_gap: mfnShippingGap,
+    freight_estimate_on_estimate_pct: freightEstimateOnEstimatePct,
+    contribution_before_ads: contributionBeforeAds,
+    contribution_after_ads: contributionAfterAds,
+    payment_tacos_pct: tacos,
+  };
+}

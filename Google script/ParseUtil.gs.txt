@@ -1,0 +1,83 @@
+/**
+ * Shared parsing helpers. No marketplace-specific logic here — only generic
+ * mechanics (European number format, CSV framing, period extraction from a
+ * dd.mm.yyyy-style datetime string). Marketplace differences belong in
+ * Config.gs.
+ */
+
+// European "1.234,56" -> 1234.56. Empty/null -> 0.
+function parseAmount_(raw) {
+  if (raw === null || raw === undefined || raw === '') return 0;
+  const s = String(raw).replace(/\./g, '').replace(',', '.');
+  const v = parseFloat(s);
+  return isNaN(v) ? 0 : v;
+}
+
+// "31.07.2026 22:03:08 UTC" -> "2026-07". Returns null if unparseable
+// (caller must treat that as an exception, never silently drop the row).
+function parsePeriod_(datetimeStr) {
+  if (!datetimeStr) return null;
+  const datePart = String(datetimeStr).replace(' UTC', '').trim().split(' ')[0];
+  const parts = datePart.split('.');
+  if (parts.length !== 3) return null;
+  const dd = parts[0], mm = parts[1], yyyy = parts[2];
+  if (yyyy.length !== 4 || mm.length !== 2) return null;
+  return yyyy + '-' + mm;
+}
+
+/**
+ * Reads a Drive file's CSV content, strips a BOM if present, auto-detects
+ * comma vs semicolon delimiter from the first 20 lines (mirrors the spike's
+ * proven approach), and returns { header: [...], rows: [[...], ...] } with
+ * `header` being the first row that has >=10 non-empty cells (Amazon Payment
+ * CSVs start with several free-text preamble lines).
+ */
+function readCsvFile_(file) {
+  const bytes = file.getBlob().getBytes();
+  let text = Utilities.newBlob(bytes).getDataAsString('UTF-8');
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+
+  const firstLines = text.split(/\r?\n/, 20).join('\n');
+  const commas = (firstLines.match(/,/g) || []).length;
+  const semicolons = (firstLines.match(/;/g) || []).length;
+  const delimiter = semicolons > commas ? ';' : ',';
+
+  const allRows = Utilities.parseCsv(text, delimiter);
+  const headerIndex = allRows.findIndex(function (r) {
+    return r.filter(function (c) { return String(c).trim() !== ''; }).length >= 10;
+  });
+  if (headerIndex < 0) {
+    return { header: [], rows: [], delimiter: delimiter };
+  }
+  const header = allRows[headerIndex].map(function (h) { return String(h).trim(); });
+  const rows = allRows.slice(headerIndex + 1).filter(function (r) {
+    return r.some(function (c) { return String(c).trim() !== ''; });
+  });
+  return { header: header, rows: rows, delimiter: delimiter };
+}
+
+// MD5 hex digest of a Drive file's bytes — used for whole-file duplicate
+// detection (e.g. a "Copy of ..." re-upload with a different file ID/name
+// but identical content). This is a deliberate trade-off vs. the validated
+// Python pipeline's cross-file ROW-level dedup: true row-level dedup across
+// files would require persisting ~63k+ dedup keys somewhere between runs,
+// which does not fit well in Sheets/Apps Script. Whole-file MD5 dedup covers
+// the known real-world case (the "Copy of 2026 08..." duplicate found
+// earlier in this project) at much lower cost. If a future marketplace
+// turns out to need real row-level cross-file dedup, revisit this.
+function fileMd5_(file) {
+  const bytes = file.getBlob().getBytes();
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, bytes)
+    .map(function (b) { return ((b + 256) % 256).toString(16).padStart(2, '0'); })
+    .join('');
+}
+
+function fmtMoney_(v) {
+  if (v === null || v === undefined || isNaN(v)) return '—';
+  return v.toLocaleString('de-DE', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function fmtPct1_(v) {
+  if (v === null || v === undefined || isNaN(v) || !isFinite(v)) return '—';
+  return v.toFixed(1) + '%';
+}

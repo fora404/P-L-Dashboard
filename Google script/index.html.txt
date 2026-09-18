@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <title>Amazon P&L Dashboard</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0; padding: 20px 16px 60px; background: #f7f7f5; color: #1f1f1f; }
+    main { max-width: 1100px; margin: 0 auto; }
+    h1 { margin: 0 0 4px; font-size: 24px; }
+    h2 { font-size: 16px; margin: 24px 0 8px; }
+    .topbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 4px; }
+    .sub { color: #666; margin: 0; font-size: 13px; }
+    button { font-size: 14px; padding: 9px 16px; border: 0; border-radius: 6px; background: #1a73e8; color: #fff; cursor: pointer; }
+    button:disabled { background: #9bb8e6; cursor: default; }
+    button.secondary { background: #eee; color: #333; }
+    .status-line { font-size: 13px; color: #666; margin: 6px 0 18px; }
+    .status-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; font-weight: 600; margin-right: 6px; }
+    .badge-ok { background: #e6f4ea; color: #137333; }
+    .badge-warn { background: #fef7e0; color: #b06000; }
+    .badge-err { background: #fce8e6; color: #c5221f; }
+    .tabs { display: flex; gap: 4px; border-bottom: 1px solid #ddd; margin-bottom: 16px; flex-wrap: wrap; }
+    .tab { padding: 8px 14px; cursor: pointer; border-bottom: 2px solid transparent; font-size: 14px; color: #555; }
+    .tab.active { border-bottom-color: #1a73e8; color: #1a73e8; font-weight: 600; }
+    .card { background: #fff; border: 1px solid #e3e3e0; border-radius: 8px; padding: 16px; margin: 10px 0; }
+    .kpi-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; }
+    .kpi { background: #fff; border: 1px solid #e3e3e0; border-radius: 8px; padding: 12px 14px; }
+    .kpi .label { font-size: 12px; color: #666; margin-bottom: 4px; }
+    .kpi .value { font-size: 20px; font-weight: 600; }
+    .kpi .value.neg { color: #c5221f; }
+    .kpi .est { font-size: 11px; color: #b06000; margin-top: 2px; }
+    .scroll { overflow-x: auto; }
+    table { border-collapse: collapse; font-size: 13px; width: 100%; }
+    td, th { border-bottom: 1px solid #eee; padding: 6px 10px; text-align: right; white-space: nowrap; }
+    th:first-child, td:first-child { text-align: left; }
+    tr:hover td { background: #fafafa; }
+    .muted { color: #888; font-size: 12px; }
+    .warn-box { background: #fef7e0; border: 1px solid #f0d68a; border-radius: 8px; padding: 12px 14px; margin: 10px 0; font-size: 13px; color: #6b4e00; }
+    .err-box { background: #fce8e6; border: 1px solid #f3b7b0; border-radius: 8px; padding: 12px 14px; margin: 10px 0; font-size: 13px; color: #8c1d18; }
+    details { margin: 16px 0; }
+    summary { cursor: pointer; color: #555; font-size: 13px; }
+    code { background: #f0f0ee; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+    .empty { color: #888; padding: 24px; text-align: center; }
+  </style>
+</head>
+<body>
+<main>
+  <div class="topbar">
+    <div>
+      <h1>Amazon P&amp;L Dashboard</h1>
+      <p class="sub" id="scopeNote">Loading...</p>
+    </div>
+    <button id="refreshBtn">Refresh Data</button>
+  </div>
+  <div class="status-line" id="statusLine">Loading dashboard data...</div>
+
+  <div id="issuesBox"></div>
+
+  <div class="tabs">
+    <div class="tab active" data-tab="overview">Europe Overview</div>
+    <div class="tab" data-tab="marketplace">Marketplace</div>
+    <div class="tab" data-tab="quality">Cost / Data Quality</div>
+  </div>
+
+  <div id="tab-overview"></div>
+  <div id="tab-marketplace" style="display:none"></div>
+  <div id="tab-quality" style="display:none"></div>
+
+  <details>
+    <summary>Diagnostics (original Drive-access feasibility test)</summary>
+    <div class="card">
+      <button id="runDiag" class="secondary">Run Drive access test</button>
+      <div id="diagOut"></div>
+    </div>
+  </details>
+</main>
+
+<script>
+  let DASHBOARD_DATA = null;
+
+  function el(tag, opts) {
+    const e = document.createElement(tag);
+    opts = opts || {};
+    if (opts.text !== undefined) e.textContent = opts.text;
+    if (opts.html !== undefined) e.innerHTML = opts.html;
+    if (opts.cls) e.className = opts.cls;
+    return e;
+  }
+
+  function fmtMoney(v) {
+    const n = Number(v);
+    if (v === '' || v === null || v === undefined || isNaN(n)) return '—';
+    return n.toLocaleString('de-DE', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €';
+  }
+
+  function fmtPct(v) {
+    if (v === '' || v === null || v === undefined || isNaN(Number(v))) return '—';
+    return Number(v).toFixed(1) + '%';
+  }
+
+  function kpi(label, value, opts) {
+    opts = opts || {};
+    const box = el('div', { cls: 'kpi' });
+    box.appendChild(el('div', { cls: 'label', text: label }));
+    const valEl = el('div', { cls: 'value' + (opts.negRed && Number(value.replace ? value : 0) < 0 ? ' neg' : ''), text: value });
+    box.appendChild(valEl);
+    if (opts.note) box.appendChild(el('div', { cls: 'est', text: opts.note }));
+    return box;
+  }
+
+  function table(headers, rows) {
+    const wrap = el('div', { cls: 'scroll' });
+    const t = el('table');
+    const trh = el('tr');
+    headers.forEach(h => trh.appendChild(el('th', { text: h })));
+    t.appendChild(trh);
+    rows.forEach(r => {
+      const tr = el('tr');
+      r.forEach(c => tr.appendChild(el('td', { text: c })));
+      t.appendChild(tr);
+    });
+    wrap.appendChild(t);
+    return wrap;
+  }
+
+  function renderOverview(data) {
+    const host = document.getElementById('tab-overview');
+    host.textContent = '';
+
+    const europeRows = data.europe;
+    if (!europeRows.length) {
+      host.appendChild(el('div', { cls: 'empty', text: 'No processed data yet. Click Refresh Data to run the pipeline.' }));
+      return;
+    }
+    const latest = europeRows[europeRows.length - 1];
+    const isValid = String(latest.europe_aggregate_valid) === 'true';
+
+    if (!isValid) {
+      host.appendChild(el('div', { cls: 'warn-box',
+        html: '<b>Not yet a valid All-Europe view.</b> Marketplaces included so far: <code>' +
+          (latest.marketplaces_included || '—') + '</code>. Shared Fixed Cost (€13,084/month) and Fixed Cost % ' +
+          'only apply once every configured marketplace is included — until then this shows the combined total ' +
+          'of whatever marketplaces have been processed, WITHOUT the shared fixed cost or fully-loaded profit.' }));
+    }
+
+    host.appendChild(el('h2', { text: 'Latest month: ' + latest.period }));
+    const grid = el('div', { cls: 'kpi-grid' });
+    grid.appendChild(kpi('Financial Product Sales ex VAT', fmtMoney(latest.financial_product_sales_ex_vat)));
+    grid.appendChild(kpi('Refunds ex VAT', fmtMoney(latest.refunds_ex_vat)));
+    grid.appendChild(kpi('Net Product Revenue', fmtMoney(latest.net_product_revenue)));
+    grid.appendChild(kpi('Direct Amazon Fees', fmtMoney(latest.direct_amazon_fees)));
+    grid.appendChild(kpi('Advertising Spend', fmtMoney(latest.advertising_spend)));
+    grid.appendChild(kpi('Payment TACoS', fmtPct(latest.payment_tacos_pct), { note: '|Advertising Spend| ÷ Financial Product Sales ex VAT' }));
+    grid.appendChild(kpi('Direct COGS', fmtMoney(latest.cogs), { note: 'Includes estimated fallback where cost is unmapped — see Cost / Data Quality tab' }));
+    grid.appendChild(kpi('Est. Upstream Freight', fmtMoney(latest.estimated_freight), {
+      note: 'TEMPORARY — Taiwan→Europe leg only, 5% of |COGS|, applied to every order row (FBA + MFN, all COGS levels). ' +
+        fmtPct(latest.freight_estimate_on_estimate_pct) + ' of this is "estimated-on-estimated" (COGS itself from the 30% fallback). ' +
+        'Pending Rebecca/Jimmy confirmation — may be removed if freight is already inside product cost.' }));
+    grid.appendChild(kpi('FBA Inbound Freight', fmtMoney(latest.fba_inbound_freight), {
+      note: 'Actual — Europe→FC inbound transport + Partnered Carrier Program charges. Separate logistics leg from Est. Upstream Freight above; never netted against it.' }));
+    grid.appendChild(kpi('MFN Shipping Gap', fmtMoney(latest.mfn_shipping_gap), {
+      note: 'TEMPORARY, unvalidated rate — MFN shipping credits minus (' + (latest.mfn_order_count || 0) +
+        ' orders × €4.00 assumed DHL cost). The €4.00 rate has no invoice backing; treat this figure as provisional, not measured.' }));
+    grid.appendChild(kpi('Other Fees', fmtMoney(latest.other_fees), { note: 'FBA warehousing: storage fees, inventory adjustments, coupon/participation fees. Inbound freight now shown separately above.' }));
+    grid.appendChild(kpi('Contribution Before Ads', fmtMoney(latest.contribution_before_ads)));
+    grid.appendChild(kpi('Contribution After Ads', fmtMoney(latest.contribution_after_ads)));
+    grid.appendChild(kpi('Shared Fixed Cost', isValid ? fmtMoney(latest.shared_fixed_cost) : '—', { note: isValid ? 'All-Europe aggregate only' : 'Not shown — Europe view not yet valid' }));
+    grid.appendChild(kpi('Fixed Cost %', isValid ? fmtPct(latest.fixed_cost_pct) : '—'));
+    grid.appendChild(kpi('Fully Loaded Contribution', isValid ? fmtMoney(latest.fully_loaded_contribution) : '—', { note: isValid ? '' : 'Not shown — Europe view not yet valid' }));
+    host.appendChild(grid);
+
+    host.appendChild(el('h2', { text: 'Monthly trend' }));
+    host.appendChild(table(
+      ['Period', 'Sales ex VAT', 'Refunds', 'Net Revenue', 'Fees', 'Ads', 'Est. Upstream Freight', 'FBA Inbound Freight', 'MFN Ship. Gap', 'Other Fees', 'Payment TACoS', 'COGS', 'Contribution Before Ads', 'Contribution After Ads', 'Fixed Cost %'],
+      europeRows.slice().reverse().map(r => [
+        r.period, fmtMoney(r.financial_product_sales_ex_vat), fmtMoney(r.refunds_ex_vat),
+        fmtMoney(r.net_product_revenue), fmtMoney(r.direct_amazon_fees), fmtMoney(r.advertising_spend),
+        fmtMoney(r.estimated_freight), fmtMoney(r.fba_inbound_freight), fmtMoney(r.mfn_shipping_gap), fmtMoney(r.other_fees),
+        fmtPct(r.payment_tacos_pct), fmtMoney(r.cogs), fmtMoney(r.contribution_before_ads),
+        fmtMoney(r.contribution_after_ads),
+        String(r.europe_aggregate_valid) === 'true' ? fmtPct(r.fixed_cost_pct) : '—',
+      ])
+    ));
+  }
+
+  function renderMarketplace(data) {
+    const host = document.getElementById('tab-marketplace');
+    host.textContent = '';
+    if (!data.monthly.length) {
+      host.appendChild(el('div', { cls: 'empty', text: 'No processed data yet. Click Refresh Data to run the pipeline.' }));
+      return;
+    }
+    host.appendChild(el('div', { cls: 'muted', text: 'Shared Fixed Cost is deliberately excluded here — it only applies at the All-Europe aggregate level (Europe Overview tab), never per marketplace.' }));
+    host.appendChild(table(
+      ['Marketplace', 'Period', 'Sales ex VAT', 'Refunds', 'Net Revenue', 'Fees', 'Ads', 'Est. Upstream Freight', 'FBA Inbound Freight', 'MFN Ship. Gap', 'Other Fees', 'Payment TACoS', 'COGS', 'Contribution Before Ads', 'Contribution After Ads', 'Rows'],
+      data.monthly.slice().sort((a, b) => (a.marketplace + a.period).localeCompare(b.marketplace + b.period)).reverse().map(r => [
+        r.marketplace, r.period, fmtMoney(r.financial_product_sales_ex_vat), fmtMoney(r.refunds_ex_vat),
+        fmtMoney(r.net_product_revenue), fmtMoney(r.direct_amazon_fees), fmtMoney(r.advertising_spend),
+        fmtMoney(r.estimated_freight), fmtMoney(r.fba_inbound_freight), fmtMoney(r.mfn_shipping_gap), fmtMoney(r.other_fees),
+        fmtPct(r.payment_tacos_pct), fmtMoney(r.cogs), fmtMoney(r.contribution_before_ads),
+        fmtMoney(r.contribution_after_ads), r.row_count,
+      ])
+    ));
+  }
+
+  function renderQuality(data) {
+    const host = document.getElementById('tab-quality');
+    host.textContent = '';
+    if (!data.dataQuality.length) {
+      host.appendChild(el('div', { cls: 'empty', text: 'No processed data yet. Click Refresh Data to run the pipeline.' }));
+      return;
+    }
+
+    const levelLabel = { 'A': 'Mapped — exact cost', 'B': 'Mapped — carried forward / average', 'A/B (BOM)': 'Mapped — BOM combo/set',
+      'C': 'Estimated — legacy 30% fallback', 'NaN': 'Missing SKU/qty on order row (no cost attempted)' };
+
+    const totals = {};
+    data.dataQuality.forEach(r => { totals[r.cogs_level] = (totals[r.cogs_level] || 0) + Number(r.rows); });
+    const totalRows = Object.values(totals).reduce((a, b) => a + b, 0);
+
+    host.appendChild(el('h2', { text: 'COGS coverage (all processed marketplaces/periods)' }));
+    const grid = el('div', { cls: 'kpi-grid' });
+    Object.keys(totals).sort().forEach(level => {
+      const pct = totalRows ? (totals[level] / totalRows * 100).toFixed(1) + '%' : '—';
+      grid.appendChild(kpi(levelLabel[level] || level, totals[level] + ' rows', { note: pct + ' of order rows' }));
+    });
+    host.appendChild(grid);
+
+    host.appendChild(el('h2', { text: 'By marketplace / period / level' }));
+    host.appendChild(table(
+      ['Marketplace', 'Period', 'Cost level', 'Rows'],
+      data.dataQuality.slice().sort((a, b) => (a.marketplace + a.period + a.cogs_level).localeCompare(b.marketplace + b.period + b.cogs_level))
+        .map(r => [r.marketplace, r.period, levelLabel[r.cogs_level] || r.cogs_level, r.rows])
+    ));
+
+    if (data.exceptions.length) {
+      host.appendChild(el('h2', { text: 'Unmapped Seller SKUs (falling to 30% fallback)' }));
+      host.appendChild(table(
+        ['Marketplace', 'Seller SKU', 'Unresolved order rows'],
+        data.exceptions.slice().sort((a, b) => Number(b.unresolved_order_rows) - Number(a.unresolved_order_rows))
+          .map(r => [r.marketplace, r.seller_sku, r.unresolved_order_rows])
+      ));
+    }
+  }
+
+  function renderIssues(data) {
+    const box = document.getElementById('issuesBox');
+    box.textContent = '';
+    if (data.hasIssues) {
+      const div = el('div', { cls: 'err-box' });
+      div.appendChild(el('div', { html: '<b>Some source files did not process cleanly:</b>' }));
+      data.issues.forEach(i => div.appendChild(el('div', { text: '• ' + i.file + ' — ' + i.status + (i.error ? ': ' + i.error : '') })));
+      div.appendChild(el('div', { text: 'The last good numbers for anything affected are still shown below. Click Refresh Data to retry.' }));
+      box.appendChild(div);
+    }
+  }
+
+  function renderAll(data) {
+    DASHBOARD_DATA = data;
+    document.getElementById('scopeNote').textContent =
+      'Configured marketplaces: ' + data.configuredMarketplaces.join(', ') +
+      ' (of ' + data.allMarketplaces.length + ' planned: ' + data.allMarketplaces.join(', ') + ')';
+    document.getElementById('statusLine').textContent = data.lastRefreshAt
+      ? 'Last data refresh: ' + new Date(data.lastRefreshAt).toLocaleString()
+      : 'No refresh has run yet.';
+    renderIssues(data);
+    renderOverview(data);
+    renderMarketplace(data);
+    renderQuality(data);
+  }
+
+  function loadDashboard(retriesLeft) {
+    if (retriesLeft === undefined) retriesLeft = 1;
+    google.script.run.withSuccessHandler(data => {
+      // google.script.run turns a server-side `undefined` return into a
+      // client-side `null`. This should not normally happen (getDashboardData
+      // always returns a plain object), but a transient double-call/timing
+      // issue can occasionally hit it -- retry once before giving up, rather
+      // than throwing on data.configuredMarketplaces.
+      if (!data) {
+        if (retriesLeft > 0) {
+          document.getElementById('statusLine').textContent = 'Load returned empty, retrying...';
+          setTimeout(() => loadDashboard(retriesLeft - 1), 800);
+        } else {
+          document.getElementById('statusLine').textContent =
+            'Failed to load dashboard data (server returned empty). Try reloading the page. ' +
+            'If this repeats, try it in an Incognito window -- a browser extension may be interfering.';
+        }
+        return;
+      }
+      renderAll(data);
+    }).withFailureHandler(err => {
+      document.getElementById('statusLine').textContent = 'Failed to load: ' + (err && err.message || err);
+    }).getDashboardData();
+  }
+
+  document.querySelectorAll('.tab').forEach(tabEl => {
+    tabEl.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      tabEl.classList.add('active');
+      ['overview', 'marketplace', 'quality'].forEach(name => {
+        document.getElementById('tab-' + name).style.display = (name === tabEl.dataset.tab) ? '' : 'none';
+      });
+    });
+  });
+
+  const refreshBtn = document.getElementById('refreshBtn');
+  refreshBtn.addEventListener('click', () => {
+    refreshBtn.disabled = true;
+    const originalText = refreshBtn.textContent;
+    refreshBtn.textContent = 'Refreshing...';
+    document.getElementById('statusLine').textContent = 'Checking for new/changed source files...';
+    google.script.run
+      .withSuccessHandler(res => {
+        refreshBtn.disabled = false;
+        refreshBtn.textContent = originalText;
+        let msg;
+        if (res.filesProcessed.length === 0 && !res.partial) {
+          msg = 'No new source data. (' + res.filesSkippedUnchanged + ' files unchanged)';
+        } else if (res.partial) {
+          msg = 'Partial — ' + res.filesProcessed.length + ' file(s) processed, ' +
+            res.filesPending.length + ' still pending. Click Refresh Data again to continue.';
+        } else {
+          msg = 'Updated — ' + res.filesProcessed.length + ' file(s) processed.';
+        }
+        if (res.filesErrored.length) msg += ' (' + res.filesErrored.length + ' error(s), see below)';
+        document.getElementById('statusLine').textContent = msg;
+        loadDashboard();
+      })
+      .withFailureHandler(err => {
+        refreshBtn.disabled = false;
+        refreshBtn.textContent = originalText;
+        document.getElementById('statusLine').textContent = 'Refresh failed: ' + (err && err.message || err);
+      })
+      .refreshDataFromClient();
+  });
+
+  document.getElementById('runDiag').addEventListener('click', () => {
+    const out = document.getElementById('diagOut');
+    out.textContent = '';
+    out.appendChild(el('div', { text: 'Running...' }));
+    google.script.run.withSuccessHandler(res => {
+      out.textContent = '';
+      out.appendChild(el('div', { text: (res.ok ? 'PASS' : 'FAIL') + ' — ' + res.totalMs + ' ms — runs as ' + res.runAs }));
+      res.steps.forEach(s => out.appendChild(el('div', { text: (s.ok ? 'PASS' : 'FAIL') + ' ' + s.name + ' — ' + s.ms + ' ms' })));
+    }).withFailureHandler(err => {
+      out.textContent = 'FAIL: ' + (err && err.message || err);
+    }).runSpike();
+  });
+
+  loadDashboard();
+</script>
+</body>
+</html>

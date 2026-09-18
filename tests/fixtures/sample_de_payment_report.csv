@@ -1,0 +1,21 @@
+﻿Amazon.de Payment Report
+Erstellt am 2026-09-01
+
+Datum/Uhrzeit,Abrechnungsnummer,Typ,Bestellnummer,SKU,Beschreibung,Menge,Marketplace,Versand,Ort der Bestellung,Bundesland,Postleitzahl,Steuererhebungsmodell,Umsätze,Produktumsatzsteuer,Gutschrift für Versandkosten,Steuer auf Versandgutschrift,Gutschrift für Geschenkverpackung,Steuer auf Geschenkverpackungsgutschriften,Rabatte aus Werbeaktionen,Steuer auf Aktionsrabatte,Einbehaltene Steuer auf Marketplace,Verkaufsgebühren,Gebühren zu Versand durch Amazon,Andere Transaktionsgebühren,Andere,Gesamt,Transaktionsstatus,Freigabedatum der Transaktion
+15.08.2026 10:00:00 UTC,S1,Bestellung,ORDER-A1,SKU-A,,2,amazon.de,Amazon,Berlin,BE,10115,,"20,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","-3,00","-2,00","0,00","0,00","15,00",Abgeschlossen,18.08.2026
+16.08.2026 10:00:00 UTC,S2,Bestellung,ORDER-B1,SKU-BAVG,,1,amazon.de,Amazon,Berlin,BE,10115,,"15,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","-2,00","-1,00","0,00","0,00","12,00",Abgeschlossen,18.08.2026
+17.08.2026 10:00:00 UTC,S3,Bestellung,ORDER-C1,SKU-BCF,,3,amazon.de,Amazon,Berlin,BE,10115,,"30,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","-4,00","-2,00","0,00","0,00","24,00",Abgeschlossen,18.08.2026
+18.08.2026 10:00:00 UTC,S4,Bestellung,ORDER-D1,SKU-BOM,,1,amazon.de,Amazon,Berlin,BE,10115,,"25,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","-3,00","-2,00","0,00","0,00","20,00",Abgeschlossen,18.08.2026
+19.08.2026 10:00:00 UTC,S5,Bestellung,ORDER-E1,SKU-C,,5,amazon.de,Amazon,Berlin,BE,10115,,"50,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","-5,00","-3,00","0,00","0,00","42,00",Abgeschlossen,18.08.2026
+20.08.2026 10:00:00 UTC,S6,Bestellung,ORDER-F1,SKU-A,,,amazon.de,Amazon,Berlin,BE,10115,,"10,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","-1,00","-1,00","0,00","0,00","8,00",Abgeschlossen,18.08.2026
+21.08.2026 10:00:00 UTC,S7,Erstattung,ORDER-A1,SKU-A,,2,amazon.de,Amazon,Berlin,BE,10115,,"-20,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","3,00","2,00","0,00","0,00","-15,00",Abgeschlossen,18.08.2026
+22.08.2026 10:00:00 UTC,S8,Servicegebühr,,,Werbekosten,,amazon.de,Amazon,Berlin,BE,10115,,"0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","-8,00","-2,00","-10,00",Abgeschlossen,18.08.2026
+23.08.2026 10:00:00 UTC,S9,Übertrag,,,,,amazon.de,Amazon,Berlin,BE,10115,,"0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","100,00","100,00",Abgeschlossen,18.08.2026
+24.08.2026 10:00:00 UTC,S10,Versand durch Amazon Lagergebühr,,,Frachtkosten für den Transport zum Amazon-Versandzentrum,,amazon.de,Amazon,Berlin,BE,10115,,"0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","-12,00","0,00","-12,00",Abgeschlossen,18.08.2026
+25.08.2026 10:00:00 UTC,S11,Anpassung,,,,,amazon.de,Amazon,Berlin,BE,10115,,"0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","-5,00","-5,00",Abgeschlossen,18.08.2026
+26.08.2026 09:00:00 UTC,S12,Bestellung,MFN-1,SKU-A,,1,amazon.de,Verkäufer,Berlin,BE,10115,,"10,00","0,00","4,00","0,00","0,00","0,00","0,00","0,00","0,00","-1,00","0,00","0,00","0,00","13,00",Abgeschlossen,18.08.2026
+26.08.2026 09:05:00 UTC,S13,Bestellung,MFN-1,SKU-BAVG,,1,amazon.de,Verkäufer,Berlin,BE,10115,,"12,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","-2,00","0,00","0,00","0,00","10,00",Abgeschlossen,18.08.2026
+27.08.2026 10:00:00 UTC,S14,Erstattung,MFN-1,SKU-A,,1,amazon.de,Verkäufer,Berlin,BE,10115,,"-5,00","0,00","-4,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","-9,00",Abgeschlossen,18.08.2026
+not-a-date,S15,Bestellung,ORDER-G1,SKU-A,,1,amazon.de,Amazon,Berlin,BE,10115,,"9,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","-1,00","0,00","0,00","0,00","8,00",Abgeschlossen,18.08.2026
+28.08.2026 10:00:00 UTC,S16,Bestellung,ORDER-H1,SKU-A,,1,amazon.de,Amazon,Berlin,BE,10115,,"10,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","0,00","-1,00","-1,00","0,00","0,00","100,00",Abgeschlossen,18.08.2026
+

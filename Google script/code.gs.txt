@@ -1,0 +1,203 @@
+/**
+ * Web App entry point + server-side functions called from Index.html.
+ *
+ * This extends the original feasibility-test spike (2026-09-15, PASSED —
+ * Drive access confirmed working, including domain-shared access). The
+ * original runSpike()/runSpikeFromEditor() diagnostic is kept intact and is
+ * still reachable from the page (collapsed "Diagnostics" section) — it is
+ * not needed for normal use now that the real pipeline exists, but it's a
+ * cheap, already-proven way to sanity-check Drive access again if something
+ * ever looks wrong.
+ */
+
+// NOTE: must NOT read MARKETPLACES here at top level. Apps Script evaluates
+// each file's top-level statements in file order (roughly alphabetical:
+// "Code.gs" runs before "Config.gs"), so MARKETPLACES would not exist yet.
+// SPIKE_CONFIG.DE_PAYMENT_FOLDER_ID is resolved lazily instead, inside
+// runSpike() below, which only runs after the whole script has loaded.
+const SPIKE_CONFIG = {
+  SAMPLE_FILE_ID: '17iTu_zgjRLP5BCSF-HCQ-2sKTOt96HeM', // 2026-02, smallest DE file
+};
+
+function doGet() {
+  return HtmlService.createHtmlOutputFromFile('Index')
+    .setTitle('Amazon P&L Dashboard');
+}
+
+/** Called on page load — reads ONLY the processed Sheets, no recompute. Must be fast. */
+function getDashboardData() {
+  const ss = getProcessedSpreadsheet_();
+  const monthly = readTable_(ss.getSheetByName('pnl_monthly_marketplace')).rows;
+  const europe = readTable_(ss.getSheetByName('pnl_monthly_europe')).rows;
+  const dq = readTable_(ss.getSheetByName('pnl_data_quality')).rows;
+  const exceptions = readTable_(ss.getSheetByName('pnl_exceptions')).rows;
+  const manifest = readTable_(ss.getSheetByName('_manifest')).rows;
+
+  const lastRefresh = manifest.reduce(function (max, r) {
+    return (r.last_processed_at && r.last_processed_at > max) ? r.last_processed_at : max;
+  }, '');
+
+  const pendingOrError = manifest.filter(function (r) { return r.status === 'error' || r.status === 'pending'; });
+
+  return {
+    monthly: monthly,
+    europe: europe,
+    dataQuality: dq,
+    exceptions: exceptions,
+    lastRefreshAt: lastRefresh || null,
+    hasIssues: pendingOrError.length > 0,
+    issues: pendingOrError.map(function (r) { return { file: r.file_name, status: r.status, error: r.error }; }),
+    configuredMarketplaces: configuredMarketplaceCodes_(),
+    allMarketplaces: allMarketplaceCodes_(),
+  };
+}
+
+/** Called by the Refresh Data button. */
+function refreshDataFromClient() {
+  return refreshData(); // defaults to all currently configured=true marketplaces (DE only, for now)
+}
+
+// ---- Diagnostics (original spike, unchanged) ----
+
+function runSpike() {
+  const started = Date.now();
+  const result = {
+    ok: true,
+    runAs: Session.getEffectiveUser().getEmail(),
+    viewer: Session.getActiveUser().getEmail(),
+    steps: [],
+  };
+
+  const step = (name, fn) => {
+    const t0 = Date.now();
+    try {
+      const data = fn();
+      result.steps.push({ name, ok: true, ms: Date.now() - t0, data });
+      return data;
+    } catch (err) {
+      result.ok = false;
+      result.steps.push({ name, ok: false, ms: Date.now() - t0, error: String(err && err.message || err) });
+      return null;
+    }
+  };
+
+  step('List DE Payment folder (file fingerprints)', () => {
+    const folder = DriveApp.getFolderById(MARKETPLACES.DE.driveFolderId);
+    const files = [];
+    const it = folder.getFiles();
+    while (it.hasNext()) {
+      const f = it.next();
+      files.push({
+        name: f.getName(),
+        sizeBytes: f.getSize(),
+        lastUpdated: f.getLastUpdated().toISOString(),
+      });
+    }
+    files.sort((a, b) => a.name.localeCompare(b.name));
+    return { folderName: folder.getName(), fileCount: files.length, files };
+  });
+
+  step('Read + parse one CSV', () => {
+    const file = DriveApp.getFileById(SPIKE_CONFIG.SAMPLE_FILE_ID);
+    const csvData = readCsvFile_(file);
+    return {
+      fileName: file.getName(),
+      sizeBytes: file.getSize(),
+      delimiter: csvData.delimiter,
+      columnCount: csvData.header.length,
+      header: csvData.header,
+      dataRows: csvData.rows.length,
+    };
+  });
+
+  result.totalMs = Date.now() - started;
+  return result;
+}
+
+function runSpikeFromEditor() {
+  Logger.log(JSON.stringify(runSpike(), null, 2));
+}
+
+function refreshDataFromEditor() {
+  Logger.log(JSON.stringify(refreshData(), null, 2));
+}
+
+/**
+ * Diagnostic for the 2026-09-16 "some months show almost no rows" bug.
+ * pnl_monthly_marketplace shows near-zero row_count for several DE periods
+ * even though _manifest confirms every source file processed cleanly with
+ * a correct rows_processed count -- meaning the loss happens between
+ * per-file processing and the final period aggregates, not while reading
+ * the CSVs. This dumps the actual _file_period_aggregates rows (the
+ * per-file, per-period contributions that recomputeMarketplaceAggregates_
+ * sums into pnl_monthly_marketplace), grouped by period, so we can see
+ * directly whether a period's PRIMARY file (its own-name month) actually
+ * has a stored contribution, or whether only a small boundary/trickle
+ * contribution from a neighboring file survived.
+ * Run this BEFORE forceReprocessAllFromEditor() and paste the log here if
+ * the force-reprocess doesn't fix the numbers -- it pinpoints whether the
+ * bug is in what got stored originally (this dump) or would still happen
+ * on a fresh reprocess (needs a second read after forcing).
+ */
+function dumpFilePeriodAggregatesFromEditor() {
+  const ss = getProcessedSpreadsheet_();
+  const sheet = ss.getSheetByName('_file_period_aggregates');
+  if (!sheet) {
+    Logger.log('_file_period_aggregates sheet not found in spreadsheet "' + ss.getName() + '" (' + ss.getUrl() + '). ' +
+      'This means either Refresh.gs in this editor is an older version that predates that table (re-paste ' +
+      'the current Refresh.gs and re-run), or refreshData()/refreshDataFromEditor() has never completed a ' +
+      'run in this spreadsheet yet (run refreshDataFromEditor first). Existing sheets: ' +
+      ss.getSheets().map(function (s) { return s.getName(); }).join(', '));
+    return;
+  }
+  const rows = readTable_(sheet).rows;
+  const byPeriod = {};
+  rows.forEach(function (r) {
+    const key = r.marketplace + ' ' + r.period;
+    if (!byPeriod[key]) byPeriod[key] = [];
+    byPeriod[key].push({
+      file: r.file_name,
+      row_count: r.row_count,
+      sales_ex_vat: r.financial_product_sales_ex_vat,
+      last_updated: r.last_updated,
+    });
+  });
+  Logger.log('_file_period_aggregates grouped by period (' + rows.length + ' total rows):');
+  Object.keys(byPeriod).sort().forEach(function (key) {
+    Logger.log(key + ': ' + JSON.stringify(byPeriod[key]));
+  });
+}
+
+/**
+ * Repair action for the same bug: ignores every fingerprint/manifest skip
+ * check and reprocesses all 20 DE files from scratch with the CURRENT
+ * Pipeline.gs/Refresh.gs logic, rebuilding _file_period_aggregates and
+ * every downstream table. Safe to run multiple times (idempotent given
+ * unchanged source files). Takes ~2 minutes for DE's 20 files, same as the
+ * original Stage 2 run. After this completes, reload the Web App page (or
+ * click Refresh Data once more) and check the Marketplace tab -- every
+ * period should show a row_count matching its file's real order volume
+ * (thousands, not single digits), and Payment TACoS should show a real
+ * percentage for every month with sales.
+ */
+function forceReprocessAllFromEditor() {
+  const result = refreshData(null, true);
+  Logger.log(JSON.stringify(result, null, 2));
+}
+
+/**
+ * Diagnostic for the "server returned empty" issue on the deployed page:
+ * runs the exact same function the page calls, but from the editor, where
+ * a thrown exception (with stack trace) or the real return value is fully
+ * visible in the execution log -- unlike the web client, which can only
+ * tell us success vs. null.
+ */
+function getDashboardDataFromEditor() {
+  try {
+    const data = getDashboardData();
+    Logger.log('getDashboardData() returned:');
+    Logger.log(JSON.stringify(data, null, 2));
+  } catch (e) {
+    Logger.log('getDashboardData() THREW: ' + e + '\n' + (e && e.stack));
+  }
+}
