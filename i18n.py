@@ -7,6 +7,8 @@ STRINGS = {
     "en": {
         "app_title": "FORA CARE",
         "app_subtitle": "Amazon P&L Dashboard",
+        "marketplace_section_label": "MARKETPLACE",
+        "footer_note": "Prepared for monthly performance review",
         "all_europe": "All Europe",
         "update_data": "Update Data",
         "updating": "Updating...",
@@ -25,6 +27,7 @@ STRINGS = {
         "period_q3": "Q3",
         "period_q4": "Q4",
         "kpi_net_revenue": "Net Revenue",
+        "kpi_net_revenue_note": "Selected period",
         "kpi_net_profit": "Net Profit",
         "kpi_ads_spend": "Ads Spend",
         "kpi_mfn_orders": "MFN Orders",
@@ -82,6 +85,8 @@ STRINGS = {
     "zh": {
         "app_title": "FORA CARE",
         "app_subtitle": "Amazon 损益仪表盘",
+        "marketplace_section_label": "站点",
+        "footer_note": "为月度业绩回顾准备",
         "all_europe": "全欧洲",
         "update_data": "更新数据",
         "updating": "正在更新...",
@@ -99,6 +104,7 @@ STRINGS = {
         "period_q3": "Q3",
         "period_q4": "Q4",
         "kpi_net_revenue": "净收入",
+        "kpi_net_revenue_note": "所选周期",
         "kpi_net_profit": "净利润",
         "kpi_ads_spend": "广告花费",
         "kpi_mfn_orders": "MFN 订单量",

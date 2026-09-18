@@ -45,20 +45,22 @@ with st.spinner(t("loading", lang)):
 
 # ---------------------------------------------------------------- sidebar --
 with st.sidebar:
+    st.markdown('<div class="fora-avatar">🧑‍💼</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="fora-brand">{t("app_title", lang)}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="fora-subtitle">{t("app_subtitle", lang)}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="fora-section-label">{t("marketplace_section_label", lang)}</div>', unsafe_allow_html=True)
 
-    if st.button(t("all_europe", lang), key="mkt_EUROPE", width="stretch",
+    if st.button("🌐 " + t("all_europe", lang), key="mkt_EUROPE", width="stretch",
                  type="primary" if st.session_state.selected_marketplace == "EUROPE" else "secondary"):
         st.session_state.selected_marketplace = "EUROPE"
         st.session_state.selected_pill = None
 
     if not result.monthly_europe.empty:
         latest_europe = result.monthly_europe.sort_values("period").iloc[-1]
-        st.caption(f"{t('kpi_net_profit', lang)}: "
-                   f"{latest_europe.get('fully_loaded_contribution') if latest_europe.get('europe_aggregate_valid') else latest_europe.get('contribution_after_ads')}")
-
-    st.markdown("---")
+        europe_val = (latest_europe.get("fully_loaded_contribution")
+                      if latest_europe.get("europe_aggregate_valid") else latest_europe.get("contribution_after_ads"))
+        cls = "pos" if (europe_val or 0) >= 0 else "neg"
+        st.markdown(f'<div class="fora-mkt-value {cls}">{europe_val:+,.0f} €</div>', unsafe_allow_html=True)
 
     for code in config.all_marketplace_codes():
         mkt_cfg = config.MARKETPLACES[code]
@@ -69,24 +71,16 @@ with st.sidebar:
             st.session_state.selected_pill = None
 
         if not mkt_cfg.get("configured"):
-            st.caption(f"— {t('no_data_yet_title', lang)}")
+            st.markdown(f'<div class="fora-mkt-value na">— {t("no_data_yet_title", lang)}</div>', unsafe_allow_html=True)
         else:
             df_mkt = result.monthly_marketplace[result.monthly_marketplace["marketplace"] == code]
             if not df_mkt.empty:
                 latest = df_mkt.sort_values("period").iloc[-1]
-                st.caption(f"{latest['contribution_after_ads']:,.0f} €")
+                val = latest["contribution_after_ads"]
+                cls = "pos" if val >= 0 else "neg"
+                st.markdown(f'<div class="fora-mkt-value {cls}">{val:+,.0f} €</div>', unsafe_allow_html=True)
 
     st.markdown("---")
-
-    lang_cols = st.columns(2)
-    if lang_cols[0].button("EN", width="stretch",
-                            type="primary" if lang == "en" else "secondary"):
-        st.session_state.lang = "en"
-        st.rerun()
-    if lang_cols[1].button("中文", width="stretch",
-                            type="primary" if lang == "zh" else "secondary"):
-        st.session_state.lang = "zh"
-        st.rerun()
 
     if st.button("🔄 " + t("update_data", lang), width="stretch"):
         st.session_state.refresh_key += 1
@@ -103,17 +97,37 @@ with st.sidebar:
             for w in result.warnings:
                 st.caption(w)
 
+    st.markdown(f'<div class="fora-footer">{t("footer_note", lang)}</div>', unsafe_allow_html=True)
+
 
 # ------------------------------------------------------------- main area --
 selected = st.session_state.selected_marketplace
 is_europe = selected == "EUROPE"
+mkt_display_name = t("all_europe", lang) if is_europe else config.MARKETPLACES[selected].get("displayName", selected)
+
+title_col, lang_col = st.columns([5, 1])
+with title_col:
+    st.markdown(f'<div style="font-size:22px;font-weight:700;">🌐 {mkt_display_name}</div>',
+                unsafe_allow_html=True)
+    breadcrumb_pill = st.session_state.selected_pill or ""
+    breadcrumb_pill_label = (t(f"period_{breadcrumb_pill.lower()}", lang)
+                              if breadcrumb_pill in ("YTD", "Q1", "Q2", "Q3", "Q4") else breadcrumb_pill)
+    st.caption(f"{breadcrumb_pill_label} · 🌐 {mkt_display_name}" if breadcrumb_pill else f"🌐 {mkt_display_name}")
+with lang_col:
+    lang_cols = st.columns(2)
+    if lang_cols[0].button("EN", key="lang_en", width="stretch",
+                            type="primary" if lang == "en" else "secondary"):
+        st.session_state.lang = "en"
+        st.rerun()
+    if lang_cols[1].button("中文", key="lang_zh", width="stretch",
+                            type="primary" if lang == "zh" else "secondary"):
+        st.session_state.lang = "zh"
+        st.rerun()
 
 if is_europe:
-    st.title(t("all_europe", lang))
     df = result.monthly_europe
 else:
     mkt_cfg = config.MARKETPLACES[selected]
-    st.title(mkt_cfg.get("displayName", selected))
 
     if not mkt_cfg.get("configured"):
         render_placeholder(mkt_cfg.get("displayName", selected), lang)
@@ -155,11 +169,16 @@ net_profit_value = metrics.get("fully_loaded_contribution") if is_europe_valid e
 net_profit_note = t("kpi_net_profit_note_europe", lang) if is_europe_valid else t("kpi_net_profit_note_marketplace", lang)
 
 render_kpi_row([
-    {"label": t("kpi_net_revenue", lang), "value": metrics.get("net_product_revenue")},
-    {"label": t("kpi_net_profit", lang), "value": net_profit_value, "note": net_profit_note},
-    {"label": t("kpi_ads_spend", lang), "value": metrics.get("advertising_spend")},
-    {"label": t("kpi_mfn_orders", lang), "value": metrics.get("mfn_order_count"), "is_count": True},
-    {"label": t("kpi_payment_tacos", lang), "value": metrics.get("payment_tacos_pct"), "is_pct": True},
+    {"label": t("kpi_net_revenue", lang), "value": metrics.get("net_product_revenue"),
+     "note": t("kpi_net_revenue_note", lang), "accent": "#e8a33d"},
+    {"label": t("kpi_net_profit", lang), "value": net_profit_value, "note": net_profit_note,
+     "accent": "#1e8e4a"},
+    {"label": t("kpi_ads_spend", lang), "value": metrics.get("advertising_spend"),
+     "accent": "#21396a"},
+    {"label": t("kpi_mfn_orders", lang), "value": metrics.get("mfn_order_count"), "is_count": True,
+     "accent": "#2aa8a0"},
+    {"label": t("kpi_payment_tacos", lang), "value": metrics.get("payment_tacos_pct"), "is_pct": True,
+     "accent": "#6b7a99"},
 ])
 
 if is_europe:
@@ -170,6 +189,11 @@ else:
 # ---- charts -----------------------------------------------------------
 chart_col, meter_col = st.columns([2, 1])
 with chart_col:
+    header_col, badge_col = st.columns([4, 1])
+    header_col.markdown(f'<div style="font-weight:700;margin-top:4px;">{t("chart_combo_title", lang)}</div>',
+                         unsafe_allow_html=True)
+    badge_col.markdown(f'<div class="fora-badge" style="float:right;">{t("chart_donut_title", lang)}</div>',
+                        unsafe_allow_html=True)
     monthly_rows = []
     for p in year_periods:
         row_metrics = get_period_range_metrics(df, [p], mkt_cfg=mkt_cfg_for_metrics, is_europe=is_europe)
@@ -186,7 +210,14 @@ with meter_col:
     st.plotly_chart(margin_meter(margin, lang), width="stretch")
 
 # ---- detail table -------------------------------------------------------
-st.subheader(t("detail_table_title", lang))
+detail_title_col, detail_badge_col = st.columns([4, 1])
+detail_title_col.markdown(
+    f'<div style="font-size:18px;font-weight:700;margin-top:8px;">'
+    f'{t("detail_table_title", lang)} — {st.session_state.selected_pill or ""}</div>',
+    unsafe_allow_html=True,
+)
+detail_badge_col.markdown(f'<div class="fora-badge" style="float:right;">{t("detail_view", lang)}</div>',
+                           unsafe_allow_html=True)
 
 table_columns = []
 for p in selected_periods:

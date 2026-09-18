@@ -7,13 +7,16 @@ non-negotiables (not a stylistic choice):
   Revenue; line: Contribution Margin %), NOT a single dual-y-axis plot --
   a dual-axis chart invents a correlation the alignment of two arbitrary
   scales doesn't actually show (the skill's #1 flagged anti-pattern).
-- The "donut" is a gauge/meter (arc 0-100%, one hue, same-ramp track), NOT
-  a 2-slice pie -- a single ratio against an implicit limit is exactly the
-  case the skill calls out a pie/donut as the wrong form for.
+- The "donut" is a single-ratio meter -- a ring with a filled arc (the
+  metric) against a track (the remainder), same as a linear progress
+  meter bent into a circle -- NOT a 2-slice pie comparing two independent
+  categories. A single ratio against an implicit 100% limit is exactly
+  the case the skill calls out a plain comparison-pie as the wrong form
+  for; rendering it as a filled/track ring keeps the meter semantics while
+  matching the reference mockup's ring visual.
 
-Colors are the validated default categorical palette (see the dataviz
-skill's references/palette.md): slot 1 blue for magnitude, slot 2 orange
-for the second measure, applied in fixed order.
+Colors follow the brand navy/orange pairing used in ui/styles.py, applied
+consistently: navy for magnitude/track, orange for the highlighted ratio.
 """
 
 from __future__ import annotations
@@ -23,24 +26,24 @@ from plotly.subplots import make_subplots
 
 from i18n import month_label, t
 
-_BLUE = "#2a78d6"
-_ORANGE = "#eb6834"
-_GRID = "#e1e0d9"
-_AXIS = "#c3c2b7"
-_MUTED = "#898781"
-_INK = "#0b0b0b"
+_NAVY = "#21396a"
+_ORANGE = "#e8a33d"
+_GRID = "#eef0f5"
+_AXIS = "#c9cfdb"
+_MUTED = "#8b95ab"
+_INK = "#1b2233"
+_SURFACE = "#ffffff"
 
 
 def combo_chart(periods: list[str], net_revenue: list[float], margin_pct: list, lang: str) -> go.Figure:
     labels = [month_label(p, lang) for p in periods]
 
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
-                         row_heights=[0.6, 0.4],
-                         subplot_titles=(t("kpi_net_revenue", lang), t("chart_donut_title", lang)))
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1,
+                         row_heights=[0.62, 0.38])
 
     fig.add_trace(
         go.Bar(x=labels, y=net_revenue, name=t("kpi_net_revenue", lang),
-               marker_color=_BLUE, marker_line_width=0,
+               marker_color=_NAVY, marker_line_width=0,
                hovertemplate="%{x}: %{y:,.0f} €<extra></extra>"),
         row=1, col=1,
     )
@@ -55,9 +58,9 @@ def combo_chart(periods: list[str], net_revenue: list[float], margin_pct: list, 
     fig.update_layout(
         showlegend=False,
         hovermode="x unified",
-        margin=dict(l=10, r=10, t=36, b=10),
-        plot_bgcolor="#fcfcfb",
-        paper_bgcolor="#fcfcfb",
+        margin=dict(l=10, r=10, t=10, b=10),
+        plot_bgcolor=_SURFACE,
+        paper_bgcolor=_SURFACE,
         font=dict(color=_INK, family="system-ui, -apple-system, Segoe UI, sans-serif"),
         height=380,
     )
@@ -68,28 +71,34 @@ def combo_chart(periods: list[str], net_revenue: list[float], margin_pct: list, 
 
 
 def margin_meter(margin_pct: float | None, lang: str) -> go.Figure:
-    """A single-ratio meter (arc gauge), not a 2-slice donut -- see module
-    docstring. `margin_pct` can be negative or >100; the gauge clamps its
-    track to [-50, 100] so an unprofitable period still renders sensibly."""
+    """A single-ratio progress ring: the orange arc is the metric (clamped
+    to [0, 100] for the arc's proportions -- the exact signed value still
+    shows in the center label), the navy arc is the remainder/track."""
     value = margin_pct if margin_pct is not None else 0.0
-    lo, hi = -50, 100
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=value,
-        number={"suffix": "%", "font": {"color": _INK, "size": 36}},
-        gauge={
-            "axis": {"range": [lo, hi], "tickcolor": _MUTED, "tickfont": {"color": _MUTED}},
-            "bar": {"color": _BLUE, "thickness": 0.28},
-            "bgcolor": "#fcfcfb",
-            "borderwidth": 0,
-            "threshold": {"line": {"color": _AXIS, "width": 2}, "thickness": 0.9, "value": 0},
-        },
-        title={"text": t("chart_donut_title", lang), "font": {"color": _MUTED, "size": 13}},
+    filled = max(0.0, min(100.0, value))
+    remainder = 100.0 - filled
+
+    fig = go.Figure(go.Pie(
+        values=[filled, remainder],
+        labels=[t("chart_donut_title", lang), ""],
+        hole=0.72,
+        marker=dict(colors=[_ORANGE, _NAVY], line=dict(color=_SURFACE, width=2)),
+        textinfo="none",
+        sort=False,
+        direction="clockwise",
+        hovertemplate="%{label}: %{value:.1f}%<extra></extra>",
     ))
     fig.update_layout(
+        showlegend=False,
+        margin=dict(l=10, r=10, t=10, b=30),
         height=220,
-        margin=dict(l=20, r=20, t=40, b=10),
-        paper_bgcolor="#fcfcfb",
+        paper_bgcolor=_SURFACE,
         font=dict(family="system-ui, -apple-system, Segoe UI, sans-serif"),
+        annotations=[
+            dict(text=f"{value:.0f}%", x=0.5, y=0.56, xanchor="center", yanchor="middle",
+                 font=dict(size=30, color=_INK), showarrow=False),
+            dict(text=t("chart_donut_title", lang), x=0.5, y=0.3, xanchor="center", yanchor="middle",
+                 font=dict(size=12, color=_MUTED), showarrow=False),
+        ],
     )
     return fig

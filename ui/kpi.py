@@ -44,7 +44,15 @@ def fmt_count(v) -> str:
 
 
 def render_kpi_row(cards: list[dict]) -> None:
-    """`cards`: list of {"label", "value", "note"?, "is_pct"?, "is_count"?}."""
+    """`cards`: list of {"label", "value", "note"?, "is_pct"?, "is_count"?, "accent"?}.
+
+    IMPORTANT: every fragment concatenated into the final markdown string
+    must be a single line with no bare/whitespace-only lines in between --
+    CommonMark treats a whitespace-only line as ending a raw-HTML block, so
+    a multi-line, indented template here would make everything after the
+    first blank line (e.g. an empty optional "note") fall out of the HTML
+    block and render as literal text instead of a styled card.
+    """
     items_html = []
     for card in cards:
         raw_value = card["value"]
@@ -60,13 +68,13 @@ def render_kpi_row(cards: list[dict]) -> None:
             neg = False
         value_cls = "neg" if neg else ("pos" if (raw_value or 0) and not card.get("is_pct") and not card.get("is_count") else "")
         note_html = f'<div class="note">{html.escape(card["note"])}</div>' if card.get("note") else ""
-        items_html.append(f"""
-        <div class="fora-kpi">
-            <div class="label">{html.escape(card["label"])}</div>
-            <div class="value {value_cls}">{html.escape(value_str)}</div>
-            {note_html}
-        </div>
-        """)
+        accent = card.get("accent") or "var(--fora-accent)"
+        items_html.append(
+            f'<div class="fora-kpi" style="border-top-color:{accent}">'
+            f'<div class="label">{html.escape(card["label"])}</div>'
+            f'<div class="value {value_cls}">{html.escape(value_str)}</div>'
+            f"{note_html}</div>"
+        )
     st.markdown(f'<div class="fora-kpi-grid">{"".join(items_html)}</div>', unsafe_allow_html=True)
 
 
