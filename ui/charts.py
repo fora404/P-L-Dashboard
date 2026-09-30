@@ -1,12 +1,14 @@
 """
-Plotly charts for the monthly-trend view. Two departures from a literal
-reading of the prototype screenshot, made per the loaded dataviz skill's
-non-negotiables (not a stylistic choice):
+Plotly charts for the monthly-trend view.
 
-- The "combo chart" is two stacked panels sharing one x-axis (bars: Net
-  Revenue; line: Contribution Margin %), NOT a single dual-y-axis plot --
-  a dual-axis chart invents a correlation the alignment of two arbitrary
-  scales doesn't actually show (the skill's #1 flagged anti-pattern).
+- The "combo chart" is a single panel, two grouped bar series (Net Revenue,
+  Contribution Margin %) sharing one x-axis but each on its own y-axis
+  (secondary_y). This is a dual-axis chart, which the dataviz skill flags
+  as the #1 anti-pattern in general -- here it's a deliberate, explicit
+  user request (to match a reference mockup) made after being told the two
+  series have incompatible scales, so the margin bars carry no cross-series
+  height comparison to Net Revenue. Each series' own axis is still labeled
+  in its own color so it never reads as a shared scale.
 - The "donut" is a single-ratio meter -- a ring with a filled arc (the
   metric) against a track (the remainder), same as a linear progress
   meter bent into a circle -- NOT a 2-slice pie comparing two independent
@@ -38,35 +40,38 @@ _SURFACE = "#ffffff"
 def combo_chart(periods: list[str], net_revenue: list[float], margin_pct: list, lang: str) -> go.Figure:
     labels = [month_label(p, lang) for p in periods]
 
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1,
-                         row_heights=[0.62, 0.38])
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
 
     fig.add_trace(
         go.Bar(x=labels, y=net_revenue, name=t("kpi_net_revenue", lang),
-               marker_color=_NAVY, marker_line_width=0,
+               marker_color=_NAVY, marker_line_width=0, offsetgroup="revenue",
                hovertemplate="%{x}: %{y:,.0f} €<extra></extra>"),
-        row=1, col=1,
+        secondary_y=False,
     )
     fig.add_trace(
-        go.Scatter(x=labels, y=margin_pct, name=t("chart_donut_title", lang),
-                   mode="lines+markers", line=dict(color=_ORANGE, width=2),
-                   marker=dict(size=8, color=_ORANGE),
-                   hovertemplate="%{x}: %{y:.1f}%<extra></extra>"),
-        row=2, col=1,
+        go.Bar(x=labels, y=margin_pct, name=t("chart_donut_title", lang),
+               marker_color=_ORANGE, marker_line_width=0, offsetgroup="margin",
+               hovertemplate="%{x}: %{y:.1f}%<extra></extra>"),
+        secondary_y=True,
     )
 
     fig.update_layout(
-        showlegend=False,
+        barmode="group",
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=-0.22, xanchor="left", x=0,
+                    font=dict(color=_MUTED)),
         hovermode="x unified",
-        margin=dict(l=10, r=10, t=10, b=10),
+        margin=dict(l=10, r=10, t=10, b=40),
         plot_bgcolor=_SURFACE,
         paper_bgcolor=_SURFACE,
         font=dict(color=_INK, family="system-ui, -apple-system, Segoe UI, sans-serif"),
         height=380,
     )
     fig.update_xaxes(showgrid=False, linecolor=_AXIS, tickfont=dict(color=_MUTED))
-    fig.update_yaxes(showgrid=True, gridcolor=_GRID, zerolinecolor=_AXIS, tickfont=dict(color=_MUTED))
-    fig.update_yaxes(ticksuffix="%", row=2, col=1)
+    fig.update_yaxes(showgrid=True, gridcolor=_GRID, zerolinecolor=_AXIS,
+                      tickfont=dict(color=_NAVY), secondary_y=False)
+    fig.update_yaxes(showgrid=False, zeroline=False, ticksuffix="%",
+                      tickfont=dict(color=_ORANGE), secondary_y=True)
     return fig
 
 
